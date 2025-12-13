@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment (sehr wichtig!)
+.venv/
+venv/
+env/
+
+# OS Files
+.DS_Store
+
+# Data (Optional: Wenn du die Rohdaten nicht auf GitHub willst)
+# data/raw/
+# data/processed/
+# *.csv
+# *.npz
+# *.px
+

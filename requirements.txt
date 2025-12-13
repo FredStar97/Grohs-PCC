@@ -1,0 +1,12 @@
+pandas>=2.1
+numpy>=1.26
+pm4py==2.7.17.1
+scikit-learn>=1.4
+#tensorflow==2.15.*    # falls Probleme: tensorflow-cpu==2.15.*  oder 2.20.*
+tqdm
+matplotlib
+pydot
+lxml
+networkx
+torch>=2.3
+0

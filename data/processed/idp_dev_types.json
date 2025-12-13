@@ -1,0 +1,9 @@
+[
+  "log:Create SW anomaly",
+  "log:Insert ticket",
+  "log:Require upgrade",
+  "log:Resolve ticket",
+  "log:Take in charge ticket",
+  "log:Wait",
+  "model:Assign seriousness"
+]
