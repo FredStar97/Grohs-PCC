@@ -110,9 +110,18 @@ def load_lstm_data(processed_dir: Path):
 # Modell Architektur (Fig. 5)
 # =========================
 
+# =========================
+# Modell Architektur (Fig. 5 - Korrigiert)
+# =========================
+
 class IDPLSTM(nn.Module):
     """
-    Architektur gemäß Fig. 5.
+    Architektur gemäß Fig. 5 (1:1 Umsetzung).
+    
+    Änderungen zur vorherigen Version:
+    - Keine Feed-Forward Layer nach den LSTMs (gemäß Diagramm).
+    - Feed-Forward Layer existiert NUR für Trace Attributes.
+    - Concatenation erfolgt direkt auf den LSTM Hidden States.
     """
     def __init__(
         self, 
@@ -123,25 +132,31 @@ class IDPLSTM(nn.Module):
         super().__init__()
         
         # --- Branch 1: Activities ---
+        # Input -> Embedding -> LSTM -> Concat
         self.emb_act = nn.Embedding(len(meta["activity_vocab"]) + 1, cfg.embedding_dim, padding_idx=0)
         self.lstm_act = nn.LSTM(cfg.embedding_dim, cfg.lstm_hidden_dim, batch_first=True)
-        self.ff_act = nn.Linear(cfg.lstm_hidden_dim, cfg.projection_dim)
+        # HINWEIS: Hier kein Linear Layer (Feed Forward), da Fig. 5 dies nicht zeigt.
         
         # --- Branch 2: Resources ---
+        # Input -> Embedding -> LSTM -> Concat
         self.emb_res = nn.Embedding(len(meta["resource_vocab"]) + 1, cfg.embedding_dim, padding_idx=0)
         self.lstm_res = nn.LSTM(cfg.embedding_dim, cfg.lstm_hidden_dim, batch_first=True)
-        self.ff_res = nn.Linear(cfg.lstm_hidden_dim, cfg.projection_dim)
         
         # --- Branch 3: Month ---
+        # Input -> Embedding -> LSTM -> Concat
         self.emb_month = nn.Embedding(len(meta["month_vocab"]) + 1, cfg.embedding_dim, padding_idx=0)
         self.lstm_month = nn.LSTM(cfg.embedding_dim, cfg.lstm_hidden_dim, batch_first=True)
-        self.ff_month = nn.Linear(cfg.lstm_hidden_dim, cfg.projection_dim)
         
         # --- Branch 4: Trace Attributes ---
+        # Input -> Feed Forward -> Concat
+        # "To incorporate trace attributes ... we use a dedicated feed-forward layer for them."
+        # Dieser Layer bleibt also bestehen.
         self.ff_trace = nn.Linear(trace_input_dim, cfg.projection_dim)
         
         # --- Concat & Output Head ---
-        concat_dim = cfg.projection_dim * 4 
+        # Berechnung der Dimensionen für die Zusammenführung:
+        # 3x LSTM Output (je 64) + 1x Trace FF Output (64)
+        concat_dim = (cfg.lstm_hidden_dim * 3) + cfg.projection_dim 
         
         self.ln = nn.LayerNorm(concat_dim)
         self.act = nn.LeakyReLU()
@@ -149,33 +164,34 @@ class IDPLSTM(nn.Module):
         self.head = nn.Linear(concat_dim, 2)
         
     def forward(self, x_act, x_res, x_month, x_trace):
-        # Branch 1
+        # Branch 1: Activities
         e_act = self.emb_act(x_act)
-        _, (h_act, _) = self.lstm_act(e_act)
-        feat_act = self.ff_act(h_act[-1])
+        _, (h_act, _) = self.lstm_act(e_act) 
+        # h_act hat Shape (1, Batch, Hidden). Wir nehmen h_act[-1].
         
-        # Branch 2
+        # Branch 2: Resources
         e_res = self.emb_res(x_res)
         _, (h_res, _) = self.lstm_res(e_res)
-        feat_res = self.ff_res(h_res[-1])
         
-        # Branch 3
+        # Branch 3: Month
         e_month = self.emb_month(x_month)
         _, (h_month, _) = self.lstm_month(e_month)
-        feat_month = self.ff_month(h_month[-1])
         
-        # Branch 4
+        # Branch 4: Trace Attributes
+        # Hier wird der Feed Forward Layer angewendet
         feat_trace = self.ff_trace(x_trace)
         
-        # Concat & Head
-        concat = torch.cat([feat_act, feat_res, feat_month, feat_trace], dim=1)
+        # Concat
+        # Wir verbinden die rohen LSTM-Ausgaben mit der projektierten Trace-Ausgabe
+        concat = torch.cat([h_act[-1], h_res[-1], h_month[-1], feat_trace], dim=1)
+        
+        # Output Head (LayerNorm -> LeakyReLU -> Dropout -> Softmax/Logits)
         x = self.ln(concat)
         x = self.act(x)
         x = self.drop(x)
         logits = self.head(x)
         
         return logits
-
 
 # =========================
 # Training & Undersampling Logic

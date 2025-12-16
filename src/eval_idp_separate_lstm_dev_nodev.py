@@ -83,20 +83,28 @@ def load_data(processed_dir: Path):
 # Split-Logik
 # =========================
 
+from sklearn.model_selection import train_test_split
+
 def get_test_indices(n_samples: int, case_ids: np.ndarray) -> np.ndarray:
     """
-    Rekonstruiert exakt den Test-Split.
+    Rekonstruiert exakt den Test-Split basierend auf Unique Case IDs.
+    Muss 1:1 der Logik im Trainings-Skript entsprechen.
     """
-    gss = GroupShuffleSplit(
-        n_splits=1,
-        test_size=TEST_SIZE,
-        random_state=RANDOM_STATE,
+    unique_cases = np.unique(case_ids)
+    
+    # Im Training: train_cases, _ = train_test_split(...)
+    # Hier brauchen wir den Test-Teil:
+    _, test_cases = train_test_split(
+        unique_cases, 
+        test_size=TEST_SIZE, 
+        random_state=RANDOM_STATE
     )
-    idx = np.arange(n_samples)
-    _, test_idx = next(gss.split(idx, groups=case_ids))
-    return test_idx
-
-
+    
+    # Erstelle Maske für alle Prefixe, die zu den Test-Cases gehören
+    test_mask = np.isin(case_ids, test_cases)
+    
+    # Rückgabe der Indizes, wo die Maske True ist
+    return np.where(test_mask)[0]
 # =========================
 # Metrik-Berechnung
 # =========================

@@ -35,8 +35,8 @@ class IDPSeparateFFNConfig:
     dropout: float = 0.1
     
     batch_size: int = 256
-    lr: float = 1e-3
-    max_epochs: int = 20  # "imposing early stopping"
+    lr: float = 0.0001
+    max_epochs: int = 10  # Early Stopping -> im BPDP-Code auf max. 10 gesetzt
     
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     random_state: int = 42 # Für Reproduzierbarkeit
@@ -97,7 +97,7 @@ class IDPFFN(nn.Module):
          |
       Linear (256) -> LayerNorm -> Leaky ReLU -> Dropout
          |
-      Output Layer (Size 2) -> (Softmax implizit im Loss)
+      Output Layer (Size 2) -> Softmax (Aktivierung)
     """
     def __init__(self, input_dim: int, cfg: IDPSeparateFFNConfig):
         super().__init__()
@@ -113,8 +113,9 @@ class IDPFFN(nn.Module):
         self.act2 = nn.LeakyReLU()
         self.drop = nn.Dropout(cfg.dropout)
         
-        # Output
+        # Output Layer
         self.head = nn.Linear(cfg.hidden_dim, 2)
+        
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Block 1: Feed Forward -> LayerNorm -> Leaky ReLU
@@ -123,10 +124,11 @@ class IDPFFN(nn.Module):
         # Block 2: Feed Forward -> LayerNorm -> Leaky ReLU -> Dropout
         x = self.drop(self.act2(self.ln2(self.layer2(x))))
         
-        # Output
+        # Output Layer (Rohe Zahlen)
         logits = self.head(x)
+        
+        
         return logits
-
 
 # =========================
 # Training & Preprocessing (Section 5.2.1)
@@ -149,39 +151,35 @@ def train_single_classifier(
     y_dev = y_all[:, dev_idx].astype(np.int64)
     n_samples, n_features = X.shape
     
-    # Paper Section 5.1: "deviation types, that occur in one trace only, have to be removed"
-    if np.sum(y_dev) < 2:
-        print(f"  [SKIP] Zu wenige Abweichungen ({np.sum(y_dev)}) für Training.")
+    # --- KORREKTUR: Check auf Trace-Level (nicht Prefix-Level) ---
+    # Wir filtern die Case-IDs, wo tatsächlich eine Abweichung vorliegt (y=1)
+    deviating_cases = case_ids[y_dev == 1]
+    n_unique_dev_traces = len(np.unique(deviating_cases))
+
+    # Paper Section 5.1: "deviation types, that occur in one trace only, have to be removed" 
+    if n_unique_dev_traces < 2:
+        print(f"  [SKIP] Zu wenige deviierende Traces ({n_unique_dev_traces}) für Training.")
         return None, np.zeros(n_samples, dtype=np.float32)
 
     # -------------------------------------------------------------------------
     # 2. Split (2/3 Train, 1/3 Test) - Trace-basiert (MANUELL)
     # -------------------------------------------------------------------------
-    # Referenz aus Notebook: 
-    # x_train_idx, x_test_idx, ... = train_test_split(range(len(log)), ..., test_size=split, ...)
-    
-    # A) Einzigartige Cases finden (entspricht "log" im Notebook)
+    # A) Einzigartige Cases finden
     unique_cases = np.unique(case_ids)
     
-    # B) Die Cases splitten (nicht die Prefixe!)
-    # Paper: "We split the traces ... randomly into train (2/3) and test (1/3)"
+    # B) Die Cases splitten
     train_cases, test_cases = train_test_split(
         unique_cases, 
         test_size=1.0/3.0, 
         random_state=cfg.random_state
     )
     
-    # C) Masken erstellen, um Prefixe den Cases zuzuordnen
-    # (Entspricht der Logik im Notebook, wo über Indizes iteriert wird)
+    # C) Masken erstellen
     train_mask = np.isin(case_ids, train_cases)
-    test_mask = np.isin(case_ids, test_cases)
     
     # D) Daten aufteilen
     X_train = X[train_mask]
     y_train = y_dev[train_mask]
-    
-    # (Test-Daten brauchen wir hier im Training nur implizit, 
-    # im Referenzcode wird X_test erstellt für Evaluation)
     
     print(f"  Trace Split: {len(train_cases)} Traces Train, {len(test_cases)} Traces Test.")
     print(f"  Prefix Split: {len(y_train)} Prefixe Train (davon {np.sum(y_train)} Dev).")
@@ -192,8 +190,6 @@ def train_single_classifier(
         return None, np.zeros(n_samples, dtype=np.float32)
 
     # 3. Undersampling (One-Sided Selection)
-    # "In this design, we can undersample each deviation type individually..."
-    # Nur auf Train-Set anwenden!
     print(f"  Undersampling (OSS) auf Train-Set...")
     try:
         oss = OneSidedSelection(random_state=0, n_seeds_S=250, n_neighbors=7)
@@ -207,8 +203,8 @@ def train_single_classifier(
     device = torch.device(cfg.device)
     model = IDPFFN(input_dim=n_features, cfg=cfg).to(device)
     
-    # 5. Weighted Loss Function
-    # "weight alpha_DC = 16 ... alpha_CC = 1"
+    # 5. Weighted Loss Function (CrossEntropyLoss)
+    # CrossEntropyLoss erwartet Logits und führt intern Softmax + NLLLoss aus (numerisch stabiler)
     weights = torch.tensor([cfg.alpha_cc, cfg.alpha_dc], dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -225,14 +221,18 @@ def train_single_classifier(
             bx, by = bx.to(device), by.to(device)
             
             optimizer.zero_grad()
+            
+            # Forward Pass (gibt jetzt Logits aus)
             logits = model(bx)
+            
+            # Loss direkt auf Logits berechnen
             loss = criterion(logits, by)
+            
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
 
     # 7. Prediction (Posterior Probabilities)
-    # Wir berechnen P(y=1) für ALLE Daten (Train + Test)
     full_ds = PrefixDataset(X, y_dev)
     full_loader = DataLoader(full_ds, batch_size=cfg.batch_size * 2, shuffle=False)
     
@@ -241,8 +241,12 @@ def train_single_classifier(
     with torch.no_grad():
         for bx, _ in full_loader:
             bx = bx.to(device)
-            logits = model(bx)
-            probs = torch.softmax(logits, dim=1)
+            
+            logits = model(bx) # Wir bekommen Logits (-inf bis +inf)
+            
+            # WICHTIG: Jetzt manuell Softmax anwenden, um Wahrscheinlichkeiten zu bekommen
+            probs = torch.softmax(logits, dim=1) 
+            
             probs_list.append(probs[:, 1].cpu().numpy()) # Klasse 1 (Dev)
             
     return model, np.concatenate(probs_list)

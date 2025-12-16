@@ -116,20 +116,31 @@ class IDPCollectiveFFN(nn.Module):
 def calculate_collective_weights(y_train: np.ndarray, device: str) -> torch.Tensor:
     """
     Berechnet die Gewichte Beta_d gemäß Abschnitt 5.2.3.
+    Formel: Beta = 16 ^ (1 / (2e + log(LIR)))
     """
     n_samples, n_classes = y_train.shape
     weights = []
     
+    # Eulersche Zahl
+    e = np.e 
+    
     for i in range(n_classes):
-        dc = np.sum(y_train[:, i] == 1)
-        cc = np.sum(y_train[:, i] == 0)
+        dc = np.sum(y_train[:, i] == 1) # Deviating Traces count
+        cc = np.sum(y_train[:, i] == 0) # Conforming Traces count (für diesen Typ)
         
+        # Schutz vor Division durch Null, falls Filterung versagt hat
         if dc == 0:
             weights.append(1.0)
             continue
             
         lir = cc / dc
-        exponent = (1.0 / (2.0 * np.e)) + np.log(lir)
+        
+        # --- KORREKTUR START ---
+        # Paper: 1 geteilt durch (2e + log(LIR))
+        denominator = (2.0 * e) + np.log(lir)
+        exponent = 1.0 / denominator
+        # --- KORREKTUR ENDE ---
+        
         beta = 16.0 ** exponent
         weights.append(beta)
         
