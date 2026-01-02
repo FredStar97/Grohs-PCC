@@ -43,9 +43,18 @@ def load_data(processed_dir: Path):
     
     probs_data = np.load(probs_path, allow_pickle=True)
     P_dev_all = probs_data["P_dev"]             # (N, m) - Wahrscheinlichkeiten
+    
+    # case_ids aus Predictions verwenden (falls vorhanden), sonst aus Labels
+    # Dies stellt sicher, dass die Reihenfolge mit den Predictions übereinstimmt
+    if "case_ids" in probs_data:
+        case_ids_probs = probs_data["case_ids"]
+        # Sicherstellen, dass case_ids übereinstimmen
+        assert np.array_equal(case_ids, case_ids_probs), "case_ids stimmen nicht überein zwischen Labels und Predictions!"
+        case_ids = case_ids_probs
 
     # Sanity Check Shapes
     assert y_true_all.shape == P_dev_all.shape, "Shape Mismatch zwischen Labels und Predictions!"
+    assert len(case_ids) == y_true_all.shape[0], "Anzahl case_ids stimmt nicht mit Anzahl Samples überein!"
     
     return y_true_all, P_dev_all, case_ids, dev_types
 
@@ -54,20 +63,24 @@ def load_data(processed_dir: Path):
 # Split-Logik (KORRIGIERT)
 # =========================
 
-def get_test_mask(case_ids: np.ndarray) -> np.ndarray:
+def get_test_mask_per_type(case_ids: np.ndarray, random_state: int = RANDOM_STATE) -> np.ndarray:
     """
     Rekonstruiert exakt den Test-Split aus dem Training.
-    Nutzung von train_test_split auf unique cases.
+    
+    WICHTIG: Im Training wird für jeden Deviation-Typ ein separater Split durchgeführt.
+    Daher müssen wir hier den gleichen Split rekonstruieren.
+    
+    Nutzung von train_test_split auf unique cases, exakt wie im Training.
     """
     # 1. Alle Case-IDs einmalig holen
     unique_cases = np.unique(case_ids)
     
     # 2. Split durchführen (identischer Random State wie im Training!)
-    # Wir brauchen hier nur 'test_cases'
+    # Im Training: train_cases, test_cases = train_test_split(unique_cases, test_size=1.0/3.0, random_state=cfg.random_state)
     _, test_cases = train_test_split(
         unique_cases, 
         test_size=TEST_SIZE, 
-        random_state=RANDOM_STATE
+        random_state=random_state
     )
     
     # 3. Maske erstellen: Welche Zeilen gehören zu Test-Cases?
@@ -134,21 +147,23 @@ def main():
         print(f"Fehler: {e}")
         return
 
-    # 1. Test-Set isolieren (KORRIGIERT)
+    # 1. Test-Set isolieren (Split ist für alle Deviation-Typen identisch)
+    # Im Training wird für jeden Typ ein Split gemacht, aber da die case_ids gleich sind,
+    # ist der Split für alle Typen identisch (gleicher random_state, gleiche unique_cases)
     print("Rekonstruiere Test-Split (train_test_split auf Unique Cases)...")
-    test_mask = get_test_mask(case_ids)
+    test_mask = get_test_mask_per_type(case_ids, random_state=RANDOM_STATE)
     
     y_test = y_true_all[test_mask]
     P_test = P_dev_all[test_mask]
     
     n_test_traces = len(np.unique(case_ids[test_mask]))
-    print(f"Test-Set: {np.sum(test_mask)} Prefixe aus {n_test_traces} Traces.")
+    print(f"Test-Set: {np.sum(test_mask)} Prefixe aus {n_test_traces} Traces.\n")
 
     # 2. Evaluierung pro Typ
     results = []
     skipped_types = []
 
-    print("\n" + "="*110)
+    print("="*110)
     print(f"{'Deviation Type':<40} | {'AUC':<6} | {'Rec(Dev)':<9} | {'Pre(Dev)':<9} | {'Rec(NoDev)':<9} | {'Pre(NoDev)':<9}")
     print("-" * 110)
 

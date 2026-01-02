@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,14 @@ class IDPSeparateLSTMConfig:
     
     batch_size: int = 256
     lr: float = 1e-3
-    max_epochs: int = 20
+    max_epochs: int = 300
+    
+    # Early Stopping Parameter
+    patience: int = 10
+    validation_split: float = 0.2
+    
+    # Undersampling
+    use_oss: bool = True  # One-Sided Selection für Undersampling
     
     device: str = "cpu" 
     random_state: int = 42
@@ -48,6 +56,12 @@ class IDPSeparateLSTMConfig:
 # =========================
 # Daten-Layer
 # =========================
+
+"""
+    Konvertiert NumPy-Arrays in PyTorch-Tensoren
+__len__: Anzahl der Samples
+__getitem__: Gibt ein Sample zurück (4 Inputs + Label)
+    """
 
 class LSTMDataset(Dataset):
     def __init__(
@@ -118,10 +132,12 @@ class IDPLSTM(nn.Module):
     """
     Architektur gemäß Fig. 5 (1:1 Umsetzung).
     
-    Änderungen zur vorherigen Version:
-    - Keine Feed-Forward Layer nach den LSTMs (gemäß Diagramm).
-    - Feed-Forward Layer existiert NUR für Trace Attributes.
-    - Concatenation erfolgt direkt auf den LSTM Hidden States.
+    Struktur:
+    - Activities: Embedding -> LSTM -> Feed Forward -> Concat
+    - Resources: Embedding -> LSTM -> Feed Forward -> Concat
+    - Month: Embedding -> LSTM -> Feed Forward -> Concat
+    - Trace Attributes: Feed Forward -> Concat
+    - Concat -> LayerNorm -> LeakyReLU -> Dropout -> Output Layer (size=2)
     """
     def __init__(
         self, 
@@ -132,58 +148,68 @@ class IDPLSTM(nn.Module):
         super().__init__()
         
         # --- Branch 1: Activities ---
-        # Input -> Embedding -> LSTM -> Concat
+        # Input -> Embedding -> LSTM -> Feed Forward -> Concat
         self.emb_act = nn.Embedding(len(meta["activity_vocab"]) + 1, cfg.embedding_dim, padding_idx=0)
         self.lstm_act = nn.LSTM(cfg.embedding_dim, cfg.lstm_hidden_dim, batch_first=True)
-        # HINWEIS: Hier kein Linear Layer (Feed Forward), da Fig. 5 dies nicht zeigt.
+        self.ff_act = nn.Linear(cfg.lstm_hidden_dim, cfg.projection_dim)
         
         # --- Branch 2: Resources ---
-        # Input -> Embedding -> LSTM -> Concat
+        # Input -> Embedding -> LSTM -> Feed Forward -> Concat
         self.emb_res = nn.Embedding(len(meta["resource_vocab"]) + 1, cfg.embedding_dim, padding_idx=0)
         self.lstm_res = nn.LSTM(cfg.embedding_dim, cfg.lstm_hidden_dim, batch_first=True)
+        self.ff_res = nn.Linear(cfg.lstm_hidden_dim, cfg.projection_dim)
         
         # --- Branch 3: Month ---
-        # Input -> Embedding -> LSTM -> Concat
+        # Input -> Embedding -> LSTM -> Feed Forward -> Concat
         self.emb_month = nn.Embedding(len(meta["month_vocab"]) + 1, cfg.embedding_dim, padding_idx=0)
         self.lstm_month = nn.LSTM(cfg.embedding_dim, cfg.lstm_hidden_dim, batch_first=True)
+        self.ff_month = nn.Linear(cfg.lstm_hidden_dim, cfg.projection_dim)
         
         # --- Branch 4: Trace Attributes ---
         # Input -> Feed Forward -> Concat
-        # "To incorporate trace attributes ... we use a dedicated feed-forward layer for them."
-        # Dieser Layer bleibt also bestehen.
         self.ff_trace = nn.Linear(trace_input_dim, cfg.projection_dim)
         
         # --- Concat & Output Head ---
         # Berechnung der Dimensionen für die Zusammenführung:
-        # 3x LSTM Output (je 64) + 1x Trace FF Output (64)
-        concat_dim = (cfg.lstm_hidden_dim * 3) + cfg.projection_dim 
+        # 4x Projection Output (je 64): Activities, Resources, Month, Trace Attributes
+        concat_dim = cfg.projection_dim * 4 
         
         self.ln = nn.LayerNorm(concat_dim)
         self.act = nn.LeakyReLU()
         self.drop = nn.Dropout(cfg.dropout)
         self.head = nn.Linear(concat_dim, 2)
-        
+
+    """
+    Forward Pass für das Modell
+    x_act: Activities
+    x_res: Resources
+    x_month: Month
+    x_trace: Trace Attributes
+    """
     def forward(self, x_act, x_res, x_month, x_trace):
         # Branch 1: Activities
         e_act = self.emb_act(x_act)
         _, (h_act, _) = self.lstm_act(e_act) 
         # h_act hat Shape (1, Batch, Hidden). Wir nehmen h_act[-1].
+        feat_act = self.ff_act(h_act[-1])
         
         # Branch 2: Resources
         e_res = self.emb_res(x_res)
         _, (h_res, _) = self.lstm_res(e_res)
+        feat_res = self.ff_res(h_res[-1])
         
         # Branch 3: Month
         e_month = self.emb_month(x_month)
         _, (h_month, _) = self.lstm_month(e_month)
+        feat_month = self.ff_month(h_month[-1])
         
         # Branch 4: Trace Attributes
         # Hier wird der Feed Forward Layer angewendet
         feat_trace = self.ff_trace(x_trace)
         
         # Concat
-        # Wir verbinden die rohen LSTM-Ausgaben mit der projektierten Trace-Ausgabe
-        concat = torch.cat([h_act[-1], h_res[-1], h_month[-1], feat_trace], dim=1)
+        # Wir verbinden die projizierten Features aller Branches
+        concat = torch.cat([feat_act, feat_res, feat_month, feat_trace], dim=1)
         
         # Output Head (LayerNorm -> LeakyReLU -> Dropout -> Softmax/Logits)
         x = self.ln(concat)
@@ -209,14 +235,11 @@ def train_single_lstm_model(
     
     print(f"\n=== Training IDP-separateLSTM für Deviation-Typ {dev_idx} ({dev_name}) ===")
     
-    # 1. Labels für diesen Typ
+    # 1. Labels für diesen Typ extrahieren
     y_dev = y_all[:, dev_idx].astype(np.int64)
     n_samples = y_dev.shape[0]
     
-    # -------------------------------------------------------------------------
-    # MANUELLER TRACE SPLIT
-    # "We split the traces in the log randomly into train (2/3) and test (1/3)"
-    # -------------------------------------------------------------------------
+    # 2. Trace-basiert Split (2/3 Train, 1/3 Test)
     unique_cases = np.unique(case_ids)
     train_cases, _ = train_test_split(
         unique_cases, 
@@ -231,37 +254,67 @@ def train_single_lstm_model(
     X_month_train = inputs["X_month"][train_mask]
     X_trace_train = inputs["X_trace"][train_mask]
     y_train = y_dev[train_mask]
+    case_ids_train = case_ids[train_mask]  # Für trace-basiertes Validation Split
     
     print(f"  Trace Split: {len(train_cases)} Traces Train. (Total Samples: {len(y_train)})")
     
-    # Safety Check: Auch wenn wir global gefiltert haben, kann es durch den Split passieren,
-    # dass im Training zufällig 0 Abweichungen landen (wenn es insgesamt sehr wenige sind).
-    # Das Paper sagt: "ensure that both the training and test set contain at least one deviating trace" [cite: 417]
-    # Das ist eine Bedingung für die Auswertbarkeit. Wenn das nicht erfüllt ist, können wir nicht trainieren.
+    # 3. Prüfen, ob Train-Set mindestens eine Abweichung enthält
     if y_train.sum() == 0:
         print(f"  [WARN] Keine Abweichungen im Train-Set für {dev_name} (obwohl global >1). Skip.")
         return None, np.zeros(n_samples, dtype=np.float32)
 
-    # 2. Undersampling (OSS)
-    print(f"  Undersampling (OSS) auf Train-Set...")
-    oss = OneSidedSelection(random_state=0, n_seeds_S=250, n_neighbors=7)
-    
-    try:
-        _X_dummy, _y_dummy = oss.fit_resample(X_trace_train, y_train)
-        kept_indices = oss.sample_indices_
+    # 4. Undersampling (OSS)
+    if cfg.use_oss:
+        print(f"  Undersampling (OSS) auf Train-Set...")
+        oss = OneSidedSelection(random_state=cfg.random_state, n_seeds_S=250, n_neighbors=7)
         
-        X_act_train = X_act_train[kept_indices]
-        X_res_train = X_res_train[kept_indices]
-        X_month_train = X_month_train[kept_indices]
-        X_trace_train = X_trace_train[kept_indices]
-        y_train = y_train[kept_indices]
-    except Exception as e:
-        print(f"  [INFO] OSS fehlgeschlagen ({e}). Nutze volle Daten.")
-        pass
+        try:
+            _X_dummy, _y_dummy = oss.fit_resample(X_trace_train, y_train)
+            kept_indices = oss.sample_indices_
+            
+            X_act_train = X_act_train[kept_indices]
+            X_res_train = X_res_train[kept_indices]
+            X_month_train = X_month_train[kept_indices]
+            X_trace_train = X_trace_train[kept_indices]
+            y_train = y_train[kept_indices]
+            case_ids_train = case_ids_train[kept_indices]  # Case IDs für resampled Daten
+        except Exception as e:
+            print(f"  [INFO] OSS fehlgeschlagen ({e}). Nutze volle Daten.")
+            pass
+    else:
+        print(f"  Kein Undersampling (OSS deaktiviert).")
 
     print(f"  Train-Set nach Undersampling: {len(y_train)} Samples.")
+    
+    # 5. Validation Split (trace-basiert, 80% Train, 20% Validation)
+    unique_train_cases = np.unique(case_ids_train)
+    train_cases_final, val_cases = train_test_split(
+        unique_train_cases,
+        test_size=cfg.validation_split,
+        random_state=cfg.random_state
+    )
+    
+    train_final_mask = np.isin(case_ids_train, train_cases_final)
+    val_mask = np.isin(case_ids_train, val_cases)
+    
+    # Final Training Set
+    X_act_train_final = X_act_train[train_final_mask]
+    X_res_train_final = X_res_train[train_final_mask]
+    X_month_train_final = X_month_train[train_final_mask]
+    X_trace_train_final = X_trace_train[train_final_mask]
+    y_train_final = y_train[train_final_mask]
+    
+    # Validation Set
+    X_act_val = X_act_train[val_mask]
+    X_res_val = X_res_train[val_mask]
+    X_month_val = X_month_train[val_mask]
+    X_trace_val = X_trace_train[val_mask]
+    y_val = y_train[val_mask]
+    
+    print(f"  Validation Split: {len(train_cases_final)} Traces Train, {len(val_cases)} Traces Val")
+    print(f"  Samples: {len(y_train_final)} Train, {len(y_val)} Val")
 
-    # 3. Model Setup
+    # 6. Model initialisieren
     device = torch.device(cfg.device)
     model = IDPLSTM(
         meta=meta, 
@@ -269,18 +322,27 @@ def train_single_lstm_model(
         cfg=cfg
     ).to(device)
     
-    # 4. WCEL
+    # 7. WCEL
     weights = torch.tensor([cfg.alpha_cc, cfg.alpha_dc], dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     
-    # DataLoader
-    train_ds = LSTMDataset(X_act_train, X_res_train, X_month_train, X_trace_train, y_train)
+    # 8. DataLoaders
+    train_ds = LSTMDataset(X_act_train_final, X_res_train_final, X_month_train_final, X_trace_train_final, y_train_final)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     
-    # 5. Training Loop
+    val_ds = LSTMDataset(X_act_val, X_res_val, X_month_val, X_trace_val, y_val)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
+    
+    # 9. Training Loop mit Early Stopping
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
     model.train()
     for epoch in range(1, cfg.max_epochs + 1):
+        # Training Phase
+        epoch_train_loss = 0.0
         for (batch_act, batch_res, batch_month, batch_trace), batch_y in train_loader:
             batch_act, batch_res = batch_act.to(device), batch_res.to(device)
             batch_month, batch_trace = batch_month.to(device), batch_trace.to(device)
@@ -291,8 +353,56 @@ def train_single_lstm_model(
             loss = criterion(logits, batch_y)
             loss.backward()
             optimizer.step()
+            epoch_train_loss += loss.item()
+        
+        # Validation Phase
+        model.eval()
+        epoch_val_loss = 0.0
+        with torch.no_grad():
+            for (batch_act, batch_res, batch_month, batch_trace), batch_y in val_loader:
+                batch_act, batch_res = batch_act.to(device), batch_res.to(device)
+                batch_month, batch_trace = batch_month.to(device), batch_trace.to(device)
+                batch_y = batch_y.to(device)
+                
+                logits = model(batch_act, batch_res, batch_month, batch_trace)
+                loss = criterion(logits, batch_y)
+                epoch_val_loss += loss.item()
+        
+        avg_train_loss = epoch_train_loss / len(train_loader)
+        avg_val_loss = epoch_val_loss / len(val_loader)
+        
+        # Logging
+        print(f"  Epoch {epoch}/{cfg.max_epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # Early Stopping Check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+            print(f"    -> Bestes Modell gespeichert (Val Loss: {best_val_loss:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= cfg.patience:
+                print(f"  Early Stopping nach {epoch} Epochen (Patience: {cfg.patience})")
+                break
+        
+        model.train()
+    
+    # Training Zusammenfassung
+    actual_epochs = epoch
+    if actual_epochs < cfg.max_epochs:
+        print(f"  Training beendet nach {actual_epochs} Epochen (Early Stopping)")
+    else:
+        print(f"  Training abgeschlossen nach {actual_epochs} Epochen (Max Epochs erreicht)")
+    
+    # 10. Bestes Modell wiederherstellen
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"  Bestes Modell wiederhergestellt (Val Loss: {best_val_loss:.4f})")
+    else:
+        print(f"  [WARN] Kein bestes Modell gefunden, nutze aktuelles Modell")
             
-    # 6. Prediction
+    # 11. Prediction
     full_ds = LSTMDataset(inputs["X_act"], inputs["X_res"], inputs["X_month"], inputs["X_trace"], y_dev)
     full_loader = DataLoader(full_ds, batch_size=cfg.batch_size, shuffle=False)
     
@@ -315,9 +425,46 @@ def train_single_lstm_model(
 # =========================
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Trainiert separate LSTM-Modelle für jeden Deviation Type"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Name des Datensatzes (für Input/Output-Verzeichnis). Standard: processed/ (rückwärtskompatibel)"
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default=None,
+        help="Input-Verzeichnis für Encodings und Labels. Standard: data/processed/ oder data/processed/{dataset}/"
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=str,
+        default=None,
+        help="Verzeichnis für gespeicherte Modelle. Standard: {input-dir}/models_idp_separate_lstm/"
+    )
+    
+    args = parser.parse_args()
+    
     project_root = Path(__file__).resolve().parents[1]
-    processed_dir = project_root / "data" / "processed"
-    models_dir = processed_dir / "models_idp_separate_lstm"
+    
+    # Verzeichnisse bestimmen (rückwärtskompatibel)
+    if args.input_dir is not None:
+        processed_dir = Path(args.input_dir)
+    elif args.dataset is not None:
+        processed_dir = project_root / "data" / "processed" / args.dataset
+    else:
+        # Rückwärtskompatibel: Standard-Verzeichnis
+        processed_dir = project_root / "data" / "processed"
+    
+    if args.models_dir is not None:
+        models_dir = Path(args.models_dir)
+    else:
+        models_dir = processed_dir / "models_idp_separate_lstm"
+    
     models_dir.mkdir(parents=True, exist_ok=True)
     
     cfg = IDPSeparateLSTMConfig()
@@ -331,10 +478,7 @@ def main():
     # -----------------------------------------------------------
     # FILTERUNG gemäß Paper: "remove deviation types, that occur in one trace only" 
     # -----------------------------------------------------------
-    # Hinweis: Da y_all auf Prefix-Ebene ist und "occur in one trace" gemeint ist, 
-    # müssen wir zählen, in wie vielen UNIQUE traces ein Typ vorkommt.
-    # Wenn y_all[i, dev] = 1, dann ist in diesem Prefix eine Abweichung.
-    # Da ein Trace mehrere Prefixe mit "1" haben kann, zählen wir unique Case-IDs pro Deviation.
+    
     
     keep_indices = []
     for i in range(len(dev_types)):
@@ -380,7 +524,8 @@ def main():
         if model:
             torch.save(model.state_dict(), models_dir / f"lstm_d{i}.pt")
 
-    out_path = processed_dir / "idp_separate_lstm_probs.npz"
+    suffix = "_no_oss" if not cfg.use_oss else ""
+    out_path = processed_dir / f"idp_separate_lstm_probs{suffix}.npz"
     np.savez_compressed(
         out_path,
         P_dev=P_dev_all,

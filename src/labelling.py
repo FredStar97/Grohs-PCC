@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import argparse
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Set
@@ -25,10 +25,10 @@ N_ALIGNMENT_RUNS = 100  # Grohs: "We calculate the log-wide alignments 100 times
 
 @dataclass
 class IDPLabelingResult:
-    dev_types: List[str]          # ["log:Assign seriousness", "model:Resolve ticket", ...]
-    y: np.ndarray                 # (n_prefixes, n_dev_types) mit 0/1
-    case_ids: np.ndarray          # (n_prefixes,)
-    prefix_lengths: np.ndarray    # (n_prefixes,)
+    dev_types: List[str]          # Liste aller Abweichungstypen["log:Assign seriousness", "model:Resolve ticket", ...]
+    y: np.ndarray                 # Binäres Label Array (Zeilen = Präfixe, Spalten = Abweichungstypen)
+    case_ids: np.ndarray          # Case IDs der Präfixe
+    prefix_lengths: np.ndarray    # Länge jedes Präfixes (1..n+1)
 
 
 # =========================
@@ -37,42 +37,66 @@ class IDPLabelingResult:
 
 def is_real_activity(label) -> bool:
     """
-    Filtert '>>', None und typische tau-/unsichtbare Transitionen heraus.
-    Nur echte Aktivitäten sollen als Abweichungstyp gezählt werden.
+    Prüft, ob ein Label eine echte Aktivität ist.
+    ">>" und None sind keine echten Aktivitäten.
     """
     if label is None:
         return False
     if label == ">>":
-        return False
-    if isinstance(label, str) and label.lower().startswith("tau"):
         return False
     return True
 
 
 # -------- Log & Modell laden --------
 
+def load_event_log(log_path: str):
+    """
+    Lädt Event-Log (CSV oder XES) und wandelt es in einen PM4Py-EventLog um.
+    
+    CSV: Erwartete Spalten (wie im Helpdesk-Log):
+      - 'Case ID'
+      - 'Activity'
+      - 'Complete Timestamp'
+    
+    XES: Standard XES-Attribute werden automatisch erkannt.
+    """
+    log_path_obj = Path(log_path)
+    
+    if log_path_obj.suffix.lower() == '.xes':
+        # XES-Format: zu DataFrame, dann zu EventLog (wie bei CSV)
+        log_raw = pm4py.read_xes(log_path)
+        df = log_converter.apply(log_raw, variant=log_converter.Variants.TO_DATA_FRAME)
+        df = dataframe_utils.convert_timestamp_columns_in_df(df)
+        log = log_converter.apply(df)
+        return log
+    else:
+        # CSV-Format (bestehende Logik)
+        df = pd.read_csv(log_path)
+
+        df = df.rename(
+            columns={
+                "Case ID": "case:concept:name",
+                "Activity": "concept:name",
+                "Complete Timestamp": "time:timestamp",
+            }
+        )
+        df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
+        df = dataframe_utils.convert_timestamp_columns_in_df(df)
+
+        log = log_converter.apply(df)
+        return log
+
+
 def load_helpdesk_log(csv_path: str):
     """
     Lädt finale.csv und wandelt sie in einen PM4Py-EventLog um.
+    DEPRECATED: Verwende load_event_log() stattdessen.
     Erwartete Spalten (wie im Helpdesk-Log):
       - 'Case ID'
       - 'Activity'
       - 'Complete Timestamp'
     """
-    df = pd.read_csv(csv_path)
-
-    df = df.rename(
-        columns={
-            "Case ID": "case:concept:name",
-            "Activity": "concept:name",
-            "Complete Timestamp": "time:timestamp",
-        }
-    )
-    df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
-    df = dataframe_utils.convert_timestamp_columns_in_df(df)
-
-    log = log_converter.apply(df)
-    return log
+    return load_event_log(csv_path)
 
 
 def load_helpdesk_model(bpmn_path: str):
@@ -88,8 +112,10 @@ def load_helpdesk_model(bpmn_path: str):
 
 def extract_dev_types_from_alignments(alignments) -> Set[str]:
     """
-    Bestimmt D_{L,B} für einen kompletten Satz Alignments:
-    Menge aller (log/model)-Moves über das gesamte Log.
+    Sammelt alle unterschiedlichen Abweichungstypen aus den Alignments.
+    Log Move: Aktivität nur im Log
+    Model Move: Aktivität nur im Modell
+    Gibt die Menge aller unterschiedlichen Abweichungstypen zurück.
     """
     dev_types: Set[str] = set()
     for aln in alignments:
@@ -110,8 +136,9 @@ def extract_dev_types_from_alignments(alignments) -> Set[str]:
 
 def compute_best_alignments(log, net, im, fm, n_runs: int = N_ALIGNMENT_RUNS):
     """
-    Führt die Alignments n_runs-mal aus und wählt die Konfiguration
+    Führt die Alignments 100-mal aus und wählt die Konfiguration
     mit der kleinsten Anzahl unterschiedlicher Deviation Types |D_{L,B}|.
+    Gibt die besten Alignments und die sortierte Liste der Abweichungstypen zurück.
     """
     best_alignments = None
     best_dev_types: Set[str] | None = None
@@ -138,15 +165,10 @@ def compute_best_alignments(log, net, im, fm, n_runs: int = N_ALIGNMENT_RUNS):
 
 def compute_last_positions_for_trace(alignment, n_events: int) -> Dict[str, int]:
     """
-    Für einen Trace (ein Alignment-Objekt) wird für jeden Deviation Type d
-    die *letzte* Position pos(d) bestimmt.
-
-    Definition pos(d):
-      - Log Move (ac, >>):
-            pos(d) = Index des Events ac im Trace (1..n).
-      - Model Move (>>, ac):
-            pos(d) = log_pos + 1, wobei log_pos = bisher gesehene Log-Events.
-            -> Bei Model-Moves nach dem letzten Event wird pos(d) = n + 1.
+    Bestimmt die letzte Position, an der ein Abweichungstyp im Trace auftritt. (kann sein das Abweichungstyp mehrfach im Trace auftritt)
+    Log Move: Position = Index des Events im Trace
+    Model Move: Position = Index des nächsten Events im Trace
+    Gibt ein Dictionary zurück, das für jeden Abweichungstyp die letzte Position enthält.
     """
     last_pos: Dict[str, int] = {}
     log_pos = 0  # wie viele echte Log-Events wurden schon "verbraucht"?
@@ -178,20 +200,13 @@ def compute_last_positions_for_trace(alignment, n_events: int) -> Dict[str, int]
 
 def build_idp_labels(log, alignments, dev_types: List[str]) -> IDPLabelingResult:
     """
-    Implementiert das dynamische Labeling für individuelle Abweichungen (IDP)
-    exakt wie in Grohs 4.2 beschrieben.
-
-    Für jeden Trace t und jeden d in D_{L,B}:
-      - Sei pos(d) = letzte Position, an der d im Trace auftritt (1..n+1).
-      - Für Prefix-Länge k (1..n):
-            label(k, d) = 1, falls pos(d) > k, sonst 0.
-
-      -> Wenn d nie auftritt: label(k, d) = 0 für alle k.
-      -> Wenn pos(d) = j in [1..n]:
-             k < j  -> 1
-             k >= j -> 0   (j-1 Prefixe mit 1)
-      -> Wenn pos(d) = n+1 (Model-Move nach Trace-Ende):
-             alle Prefixe 1..n erhalten 1.
+    Erstellt Labels für jeden Präfix jedes Traces 
+    Für jeden Trace:
+        Bestimme die last_positions für jeden Abweichungstyp
+        Erstellt ein Array (n+1, m) (n+1 = Länge des Präfixes, m = Anzahl der Abweichungstypen)
+        Setzt label(k, d) = 1, falls pos(d) > k, sonst 0. (Abweichung liegt in der Zukunft)
+        Für jeden Präfix werden Label-Vektor, Case ID und Präfix-Länge gespeichert
+        Gibt ein IDPLabelingResult-Objekt zurück
     """
     m = len(dev_types)
     dev_index = {d: i for i, d in enumerate(dev_types)}
@@ -209,7 +224,8 @@ def build_idp_labels(log, alignments, dev_types: List[str]) -> IDPLabelingResult
             continue
 
         last_positions = compute_last_positions_for_trace(alignment, n)
-        labels_trace = np.zeros((n, m), dtype=np.int8)
+        # n+1 Prefixe: Längen 1..n+1 (der vollständige Trace ist Prefix n+1)
+        labels_trace = np.zeros((n + 1, m), dtype=np.int8)
 
         # Fülle für jeden Deviation Type die 1er-Blöcke (Prefixe, in deren Zukunft d liegt)
         for dev, pos in last_positions.items():
@@ -217,12 +233,13 @@ def build_idp_labels(log, alignments, dev_types: List[str]) -> IDPLabelingResult
             if idx is None:
                 continue
             # bis Prefix (pos-1) ist d noch in der Zukunft
-            cutoff = min(max(pos - 1, 0), n)
+            # Bei pos = n+1: alle Prefixe 1..n+1 erhalten 1
+            cutoff = min(max(pos - 1, 0), n + 1)
             if cutoff > 0:
                 labels_trace[:cutoff, idx] = 1
 
         # Jetzt Prefix-Metadaten sammeln
-        for k in range(n):  # k = 0..n-1 -> Prefix-Länge = k+1
+        for k in range(n + 1):  # k = 0..n -> Prefix-Länge = k+1 (1..n+1)
             all_labels.append(labels_trace[k])
             case_ids.append(case_id)
             prefix_lengths.append(k + 1)
@@ -241,18 +258,72 @@ def build_idp_labels(log, alignments, dev_types: List[str]) -> IDPLabelingResult
 
 
 # -------- Hauptfunktion zum Ausführen als Skript --------
+"""
+Pfade setzen.
+Log und Modell laden.
+Beste Alignments berechnen.
+Labels erstellen.
+Ergebnisse speichern (NPZ und JSON).
+"""
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Erstellt IDP-Labels aus Event-Log und BPMN-Modell"
+    )
+    parser.add_argument(
+        "--log",
+        type=str,
+        default=None,
+        help="Pfad zum Event-Log (CSV oder XES). Standard: data/raw/finale.csv"
+    )
+    parser.add_argument(
+        "--bpmn",
+        type=str,
+        default=None,
+        help="Pfad zum BPMN-Modell. Standard: data/raw/Helpdesk.bpmn"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Name des Datensatzes (für Output-Verzeichnis). Standard: processed/ (rückwärtskompatibel)"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output-Verzeichnis. Standard: data/processed/ oder data/processed/{dataset}/"
+    )
+    
+    args = parser.parse_args()
+    
     project_root = Path(__file__).resolve().parents[1]
     raw_dir = project_root / "data" / "raw"
-    processed_dir = project_root / "data" / "processed"
+    
+    # Pfade bestimmen (rückwärtskompatibel)
+    if args.log is None:
+        log_path = raw_dir / "finale.csv"
+    else:
+        log_path = Path(args.log)
+    
+    if args.bpmn is None:
+        bpmn_path = raw_dir / "Helpdesk.bpmn"
+    else:
+        bpmn_path = Path(args.bpmn)
+    
+    # Output-Verzeichnis bestimmen
+    if args.output_dir is not None:
+        processed_dir = Path(args.output_dir)
+    elif args.dataset is not None:
+        processed_dir = project_root / "data" / "processed" / args.dataset
+    else:
+        # Rückwärtskompatibel: Standard-Verzeichnis
+        processed_dir = project_root / "data" / "processed"
+    
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    csv_path = raw_dir / "finale.csv"
-    bpmn_path = raw_dir / "Helpdesk.bpmn"
-
-    print(f"Lade Event Log aus {csv_path} ...")
-    log = load_helpdesk_log(str(csv_path))
+    print(f"Lade Event Log aus {log_path} ...")
+    log = load_event_log(str(log_path))
 
     print(f"Lade BPMN-Modell aus {bpmn_path} ...")
     net, im, fm = load_helpdesk_model(str(bpmn_path))

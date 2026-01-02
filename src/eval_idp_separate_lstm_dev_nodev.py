@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from sklearn.metrics import precision_score, recall_score, roc_auc_score
-from sklearn.model_selection import GroupShuffleSplit
 
 # =========================
 # Konfiguration
