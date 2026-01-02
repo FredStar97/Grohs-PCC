@@ -48,9 +48,12 @@ class IDPSeparateFFNConfig:
     # Early Stopping Parameter
     patience: int = 10
     validation_split: float = 0.2
+<<<<<<< Updated upstream
     
     # Undersampling
     use_oss: bool = True  # One-Sided Selection für Undersampling
+=======
+>>>>>>> Stashed changes
     
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     random_state: int = 42 # Für Reproduzierbarkeit
@@ -121,9 +124,15 @@ class IDPFFN(nn.Module):
          |
       Linear (256) -> LayerNorm -> Leaky ReLU -> Dropout
          |
+<<<<<<< Updated upstream
       Output Layer (Size 2) -> Logits (ohne Softmax)
 
       Die Softmax wird in der Loss-Funktion angewendet (numerisch stabiler).
+=======
+      Output Layer (Size 2) -> Softmax (Aktivierung)
+
+      Am Ende wird die Softmax-Aktivierung angewandt, um die Wahrscheinlichkeiten für die beiden Klassen zu berechnen.
+>>>>>>> Stashed changes
     """
     def __init__(self, input_dim: int, cfg: IDPSeparateFFNConfig):
         super().__init__()
@@ -141,6 +150,11 @@ class IDPFFN(nn.Module):
         
         # Output Layer (gibt Logits zurück, keine Wahrscheinlichkeiten)
         self.head = nn.Linear(cfg.hidden_dim, 2)
+<<<<<<< Updated upstream
+=======
+        # Softmax als Teil der Architektur (Paper-konform)
+        self.softmax = nn.Softmax(dim=1)
+>>>>>>> Stashed changes
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Block 1: Feed Forward -> LayerNorm -> Leaky ReLU
@@ -149,15 +163,25 @@ class IDPFFN(nn.Module):
         # Block 2: Feed Forward -> LayerNorm -> Leaky ReLU -> Dropout
         x = self.drop(self.act2(self.ln2(self.layer2(x))))
         
+<<<<<<< Updated upstream
         # Output Layer -> Logits (Softmax wird in Loss-Funktion angewendet)
+=======
+        # Output Layer -> Softmax (Paper-konform)
+>>>>>>> Stashed changes
         logits = self.head(x)
+        probs = self.softmax(logits)
         
+<<<<<<< Updated upstream
         return logits
+=======
+        return probs
+>>>>>>> Stashed changes
 
 # =========================
 # Training & Preprocessing (Section 5.2.1)
 # =========================
 
+<<<<<<< Updated upstream
 def weighted_cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor, 
                                 alpha_cc: float, alpha_dc: float) -> torch.Tensor:
     """
@@ -169,12 +193,29 @@ def weighted_cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor,
     -log(softmax(logits)[correct_class]) = -log_softmax(logits)[correct_class]
     """
     device = logits.device
+=======
+def weighted_cross_entropy_loss(probs: torch.Tensor, targets: torch.Tensor, 
+                                alpha_cc: float, alpha_dc: float) -> torch.Tensor:
+    """
+    Gewichteter Cross-Entropy auf Wahrscheinlichkeiten
+    alpha_cc: Gewicht für Klasse 0 (Non-Deviating)
+    alpha_dc: Gewicht für Klasse 1 (Deviating)
+    probs [0,1] wurden durch Softmax generiert, dann wir -log auf die Wahrscheinlichkeit der korrekten Klasse angewandt.
+    Und das dann mit Gewichten
+    und dann die mittlere loss über alle Samples berechnet.
+    """
+    device = probs.device
+    # One-hot encoding der Targets
+    targets_one_hot = torch.zeros_like(probs)
+    targets_one_hot.scatter_(1, targets.unsqueeze(1), 1)
+>>>>>>> Stashed changes
     
     # Gewichte: alpha_cc für Klasse 0, alpha_dc für Klasse 1
     weights = torch.where(targets == 0, 
                          torch.tensor(alpha_cc, device=device),
                          torch.tensor(alpha_dc, device=device))
     
+<<<<<<< Updated upstream
     # Cross-entropy: -log(softmax(logits)[correct_class])
     # Numerisch stabil: log_softmax statt log(softmax(...))
     log_probs = F.log_softmax(logits, dim=1)
@@ -184,6 +225,13 @@ def weighted_cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor,
     loss_per_sample = -log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
     
     # Gewichteter Loss
+=======
+    # Cross-entropy: -log(p_correct_class)
+    # Numerisch stabil: log(probs + eps) statt log(probs)
+    eps = 1e-8
+    log_probs = torch.log(probs + eps)
+    loss_per_sample = -torch.sum(targets_one_hot * log_probs, dim=1)
+>>>>>>> Stashed changes
     weighted_loss = weights * loss_per_sample
     
     return weighted_loss.mean()
@@ -246,6 +294,7 @@ def train_single_classifier(
         return None, np.zeros(n_samples, dtype=np.float32)
 
     # 3. One-Sided Selection zur Reduzierung der Mehrheitsklasse
+<<<<<<< Updated upstream
     if cfg.use_oss:
         print(f"  Undersampling (OSS) auf Train-Set...")
         try:
@@ -259,6 +308,17 @@ def train_single_classifier(
             X_train_res, y_train_res = X_train, y_train
     else:
         print(f"  Kein Undersampling (OSS deaktiviert).")
+=======
+    print(f"  Undersampling (OSS) auf Train-Set...")
+    try:
+        oss = OneSidedSelection(random_state=0, n_seeds_S=250, n_neighbors=7)
+        X_train_res, y_train_res = oss.fit_resample(X_train, y_train)
+        kept_indices = oss.sample_indices_
+        case_ids_train = case_ids_train[kept_indices]  # Case IDs für resampled Daten
+        print(f"  Resampled Train-Set: {len(X_train_res)} Samples (Dev: {sum(y_train_res)})")
+    except Exception as e:
+        print(f"  [WARN] OSS fehlgeschlagen ({e}), nutze originale Daten.")
+>>>>>>> Stashed changes
         X_train_res, y_train_res = X_train, y_train
     
     # 4. Validation Split (trace-basiert, 80% Train, 20% Validation)
@@ -312,11 +372,19 @@ def train_single_classifier(
             
             optimizer.zero_grad()
             
+<<<<<<< Updated upstream
             # Forward Pass (gibt Logits aus)
             logits = model(bx)
             
             # Gewichteter Loss auf Logits (Softmax wird intern angewendet)
             loss = weighted_cross_entropy_loss(logits, by, cfg.alpha_cc, cfg.alpha_dc)
+=======
+            # Forward Pass (gibt jetzt Wahrscheinlichkeiten aus)
+            probs = model(bx)
+            
+            # Gewichteter Loss auf Wahrscheinlichkeiten
+            loss = weighted_cross_entropy_loss(probs, by, cfg.alpha_cc, cfg.alpha_dc)
+>>>>>>> Stashed changes
             
             loss.backward()
             optimizer.step()
@@ -329,8 +397,13 @@ def train_single_classifier(
             for bx, by in val_loader:
                 bx, by = bx.to(device), by.to(device)
                 
+<<<<<<< Updated upstream
                 logits = model(bx)
                 loss = weighted_cross_entropy_loss(logits, by, cfg.alpha_cc, cfg.alpha_dc)
+=======
+                probs = model(bx)
+                loss = weighted_cross_entropy_loss(probs, by, cfg.alpha_cc, cfg.alpha_dc)
+>>>>>>> Stashed changes
                 epoch_val_loss += loss.item()
         
         avg_train_loss = epoch_train_loss / len(train_loader)
@@ -370,7 +443,11 @@ def train_single_classifier(
     # 10. Prediction (Posterior Probabilities)
     """
     Evaluation auf allen Daten
+<<<<<<< Updated upstream
     Modell gibt Logits zurück, Softmax wird hier angewendet
+=======
+    Modell gibt bereits Wahrscheinlichkeiten zurück (keine manuelle Softmax)
+>>>>>>> Stashed changes
     Extrahiert Wahrscheinlichkeit für Klasse 1 (Deviation)
     Gibt Modell und Wahrscheinlichkeiten zurück
 
@@ -384,9 +461,14 @@ def train_single_classifier(
         for bx, _ in full_loader:
             bx = bx.to(device)
             
+<<<<<<< Updated upstream
             # Modell gibt Logits aus, Softmax wird hier angewendet
             logits = model(bx)
             probs = F.softmax(logits, dim=1)
+=======
+            # Modell gibt bereits Wahrscheinlichkeiten aus 
+            probs = model(bx)
+>>>>>>> Stashed changes
             
             probs_list.append(probs[:, 1].cpu().numpy()) # Klasse 1 (Dev)
             

@@ -45,12 +45,16 @@ class EncodingMeta:
 
 def load_event_log_to_df(log_path: str) -> pd.DataFrame:
     """
+<<<<<<< Updated upstream
     Lädt Event-Log (CSV oder XES) und konvertiert es zu einem DataFrame.
     
     CSV: Direktes Laden mit erwarteten Spalten.
     XES: Konvertierung von PM4Py EventLog zu DataFrame mit Standard-Spalten.
     
     1. Log laden (CSV oder XES)
+=======
+    1. CSV laden
+>>>>>>> Stashed changes
     2. Prüfen, dass Case ID, Activity, Complete Timestamp vorhanden sind
     3. Prüfen, dass Resource vorhanden ist
     4. Timestamp parsen und Month ableiten

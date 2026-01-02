@@ -1,0 +1,110 @@
+{
+  "n_dev_types_1run": 7,
+  "n_dev_types_100run": 7,
+  "n_common_dev_types": 7,
+  "dev_types_only_1run": [],
+  "dev_types_only_100run": [],
+  "jaccard_dev_types": 1.0,
+  "n_prefixes_1run": 25928,
+  "n_prefixes_100run": 25928,
+  "same_prefix_order": true,
+  "per_dev_type_label_counts": {
+    "log:Create SW anomaly": {
+      "present_in_1run": true,
+      "present_in_100run": true,
+      "positives_1run": 75,
+      "positives_100run": 75,
+      "positive_ratio_1run": 0.002892625732798519,
+      "positive_ratio_100run": 0.002892625732798519
+    },
+    "log:Insert ticket": {
+      "present_in_1run": true,
+      "present_in_100run": true,
+      "positives_1run": 0,
+      "positives_100run": 0,
+      "positive_ratio_1run": 0.0,
+      "positive_ratio_100run": 0.0
+    },
+    "log:Require upgrade": {
+      "present_in_1run": true,
+      "present_in_100run": true,
+      "positives_1run": 262,
+      "positives_100run": 262,
+      "positive_ratio_1run": 0.010104905893242826,
+      "positive_ratio_100run": 0.010104905893242826
+    },
+    "log:Resolve ticket": {
+      "present_in_1run": true,
+      "present_in_100run": true,
+      "positives_1run": 895,
+      "positives_100run": 900,
+      "positive_ratio_1run": 0.03451866707806232,
+      "positive_ratio_100run": 0.03471150879358223
+    },
+    "log:Take in charge ticket": {
+      "present_in_1run": true,
+      "present_in_100run": true,
+      "positives_1run": 834,
+      "positives_100run": 834,
+      "positive_ratio_1run": 0.03216599814871953,
+      "positive_ratio_100run": 0.03216599814871953
+    },
+    "log:Wait": {
+      "present_in_1run": true,
+      "present_in_100run": true,
+      "positives_1run": 1636,
+      "positives_100run": 1598,
+      "positive_ratio_1run": 0.0630978093181117,
+      "positive_ratio_100run": 0.06163221228016044
+    },
+    "model:Assign seriousness": {
+      "present_in_1run": true,
+      "present_in_100run": true,
+      "positives_1run": 53,
+      "positives_100run": 53,
+      "positive_ratio_1run": 0.0020441221845109536,
+      "positive_ratio_100run": 0.0020441221845109536
+    }
+  },
+  "labels_total_common": 181496,
+  "labels_equal_common": 181449,
+  "labels_diff_common": 47,
+  "labels_equal_ratio_common": 0.9997410411248733,
+  "per_dev_type_common": {
+    "log:Create SW anomaly": {
+      "labels_equal": 25928,
+      "labels_total": 25928,
+      "labels_equal_ratio": 1.0
+    },
+    "log:Insert ticket": {
+      "labels_equal": 25928,
+      "labels_total": 25928,
+      "labels_equal_ratio": 1.0
+    },
+    "log:Require upgrade": {
+      "labels_equal": 25928,
+      "labels_total": 25928,
+      "labels_equal_ratio": 1.0
+    },
+    "log:Resolve ticket": {
+      "labels_equal": 25923,
+      "labels_total": 25928,
+      "labels_equal_ratio": 0.9998071582844801
+    },
+    "log:Take in charge ticket": {
+      "labels_equal": 25928,
+      "labels_total": 25928,
+      "labels_equal_ratio": 1.0
+    },
+    "log:Wait": {
+      "labels_equal": 25886,
+      "labels_total": 25928,
+      "labels_equal_ratio": 0.9983801295896328
+    },
+    "model:Assign seriousness": {
+      "labels_equal": 25928,
+      "labels_total": 25928,
+      "labels_equal_ratio": 1.0
+    }
+  }
+}
