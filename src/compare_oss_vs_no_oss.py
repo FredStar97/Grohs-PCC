@@ -825,11 +825,40 @@ def main():
     """
     Hauptfunktion: Trainiert alle Modelle mit und ohne OSS und vergleicht die Ergebnisse.
     """
-    project_root = Path(__file__).resolve().parents[1]
-    processed_dir = project_root / "data" / "processed"
+    import argparse
     
+    parser = argparse.ArgumentParser(
+        description="Vergleicht Modelle mit und ohne OSS (One-Sided Selection)"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Name des Datensatzes (für Input/Output-Verzeichnis). Standard: processed/ (rückwärtskompatibel)"
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default=None,
+        help="Input-Verzeichnis für Encodings und Labels. Standard: data/processed/ oder data/processed/{dataset}/"
+    )
+    
+    args = parser.parse_args()
+    
+    project_root = Path(__file__).resolve().parents[1]
+    
+    # Verzeichnisse bestimmen (rückwärtskompatibel)
+    if args.input_dir is not None:
+        processed_dir = Path(args.input_dir)
+    elif args.dataset is not None:
+        processed_dir = project_root / "data" / "processed" / args.dataset
+    else:
+        # Rückwärtskompatibel: Standard-Verzeichnis
+        processed_dir = project_root / "data" / "processed"
+    
+    dataset_name = args.dataset if args.dataset else "default"
     print("="*80)
-    print("OSS vs. Non-OSS Vergleich")
+    print(f"OSS vs. Non-OSS Vergleich - Dataset: {dataset_name}")
     print("="*80)
     
     # Modelle die verglichen werden sollen

@@ -22,10 +22,7 @@ from imblearn.under_sampling import OneSidedSelection
 @dataclass
 class IDPCollectiveLSTMConfig:
     """
-<<<<<<< Updated upstream
     Konfiguration für IDP-collectiveLSTM gemäß Paper Section 5.2.4.
-=======
->>>>>>> Stashed changes
     
     Ein einzelnes LSTM-Modell wird trainiert, um alle Deviation Types gleichzeitig
     vorherzusagen (Multi-Label Klassifikation). Die Architektur verwendet 4 Branches:
@@ -47,18 +44,15 @@ class IDPCollectiveLSTMConfig:
     # Training-Parameter
     batch_size: int = 256        # Anzahl Samples pro Batch
     lr: float = 1e-3             # Learning Rate für Adam Optimizer
-    max_epochs: int = 100        # Maximale Anzahl Epochen (harte Obergrenze)
+    max_epochs: int = 300        # Maximale Anzahl Epochen (harte Obergrenze)
     
     # Early Stopping Parameter
     patience: int = 10                    # Epochen ohne Verbesserung, bevor Training stoppt
     validation_split: float = 0.2         # Anteil des Training Sets für Validation (20%)
     
-<<<<<<< Updated upstream
     # Undersampling
     use_oss: bool = True  # One-Sided Selection für Undersampling
     
-=======
->>>>>>> Stashed changes
     # System-Parameter
     device: str = "cpu"          # CPU erzwingen (cuDNN-Konflikt auf Server vermeiden)
     random_state: int = 42       # Random Seed für Reproduzierbarkeit
@@ -77,16 +71,8 @@ class CollectiveLSTMDataset(Dataset):
     - Resources: Sequenz von Ressourcen (Integer-IDs)
     - Month: Sequenz von Monaten (Integer-IDs)
     - Trace Attributes: Kontinuierliche Trace-Features (Float)
-<<<<<<< Updated upstream
     
     Die Labels sind Multi-Label (mehrere Deviation Types können gleichzeitig auftreten).
-=======
-
-    __init__: Konvertiert NumPy-Arrays zu PyTorch-Tensoren (float32)
-    __len__: Gibt Anzahl der Samples zurück
-    __getitem__: Gibt ein Sample (Features, Labels) zurück
-    .
->>>>>>> Stashed changes
     """
     def __init__(
         self, 
@@ -128,7 +114,6 @@ class CollectiveLSTMDataset(Dataset):
 
 def load_lstm_data(processed_dir: Path):
     """
-<<<<<<< Updated upstream
     Lädt die vorverarbeiteten Daten für das Collective LSTM Modell.
     
     Args:
@@ -147,14 +132,6 @@ def load_lstm_data(processed_dir: Path):
         
     Raises:
         FileNotFoundError: Falls erforderliche Dateien fehlen
-=======
-    Zweck: Lädt die vorverarbeiteten Daten.
-    Schritte:
-    LSTM-Encodings laden (encoding_lstm.npz): Activities-, Resources-, Month-Sequenzen und Trace-Features
-    Labels laden (idp_labels.npz): Multi-Label-Matrix, Case-IDs, Deviation-Type-Namen
-    Meta-Informationen laden (encoding_meta.json): Vocabularies für Embedding-Größen
-    Rückgabe: Dictionary mit 4 Input-Komponenten, Labels, Case-IDs, Deviation-Type-Namen, Meta-Informationen
->>>>>>> Stashed changes
     """
     # 1. LSTM-Encodings laden (Sequenzen für Activities, Resources, Month + Trace Features)
     enc_path = processed_dir / "encoding_lstm.npz"
@@ -191,7 +168,6 @@ def load_lstm_data(processed_dir: Path):
 
 class IDPCollectiveLSTM(nn.Module):
     """
-<<<<<<< Updated upstream
     LSTM-Netzwerk für Collective Deviation Prediction (gemäß Paper Fig. 7).
     
     Ein einzelnes Modell, das alle Deviation Types gleichzeitig vorhersagt
@@ -201,16 +177,6 @@ class IDPCollectiveLSTM(nn.Module):
     - Alle Branches werden zusammengeführt und durch Output Layer geleitet
     
     Die Sigmoid-Aktivierung wird bei der Vorhersage angewendet (nicht im Forward Pass).
-=======
-    Zweck: LSTM-Netzwerk mit 4 Branches für Multi-Label-Klassifikation.
-    Architektur:
-    __init__ (Zeilen 177-214):
-    Branch 1 (Activities): Embedding → LSTM → Feed-Forward
-    Branch 2 (Resources): Embedding → LSTM → Feed-Forward
-    Branch 3 (Month): Embedding → LSTM → Feed-Forward
-    Branch 4 (Trace Attributes): Feed-Forward (kein LSTM)
-    Zusammenführung: Konkatenation → LayerNorm → LeakyReLU → Dropout → Output Layer
->>>>>>> Stashed changes
     """
     def __init__(
         self, 
@@ -303,11 +269,8 @@ def calculate_collective_weights(y_train: np.ndarray, device: str) -> torch.Tens
     """
     Berechnet die Klassen-Gewichte Beta_d für die gewichtete Loss-Funktion.
     
-<<<<<<< Updated upstream
     Gemäß Paper Section 5.2.4 wird für jeden Deviation Type d ein Gewicht β_d
     berechnet, um die Klassen-Ungleichgewichte auszugleichen.
-=======
->>>>>>> Stashed changes
     
     Formel: β_d = 16 ^ (1/(2e) + log(LIR_d))
     wobei:
@@ -407,7 +370,6 @@ def train_collective_lstm(
     print(f"  Split: {len(train_cases)} Traces im Training (Samples: {len(y_train)}).")
 
     # 2. Collective Undersampling (OSS - One-Sided Selection)
-<<<<<<< Updated upstream
     if cfg.use_oss:
         print("  Collective Undersampling (OSS)...")
         
@@ -498,95 +460,6 @@ def train_collective_lstm(
     # Die Gewichte werden auf dem finalen Training Set berechnet
     beta_d = calculate_collective_weights(y_train_final, cfg.device)
     
-=======
-    print("  Collective Undersampling (OSS)...")
-    
-    # Hilfs-Label erstellen: Hat ein Prefix irgendeine Abweichung? (0=conforming, 1=deviant)
-    # Dies wird für OSS verwendet, das auf binärer Klassifikation basiert
-    y_is_deviant = (np.sum(y_train, axis=1) > 0).astype(int)
-    n_dev_before = int(np.sum(y_is_deviant))
-    n_conf_before = int(len(y_is_deviant) - n_dev_before)
-    print(f"  Vor OSS - Deviant Traces: {n_dev_before}, Conforming Traces: {n_conf_before}")
-    
-    try:
-        # OSS: Entfernt redundante Conforming Samples, behält alle Deviating Samples
-        oss = OneSidedSelection(
-            n_neighbors=7,              # Anzahl Nachbarn für Tomek Links
-            n_seeds_S=250,              # Anzahl Seed-Samples
-            random_state=cfg.random_state
-        )
-        
-        # OSS benötigt eine flache Feature-Repräsentation
-        # Daher werden alle 4 Input-Komponenten zu einem Feature-Vektor konkateniert
-        n_samples_train = X_trace_train.shape[0]
-        X_oss_train = np.concatenate(
-            [
-                X_act_train.reshape(n_samples_train, -1),   # Activities flach machen
-                X_res_train.reshape(n_samples_train, -1),  # Resources flach machen
-                X_month_train.reshape(n_samples_train, -1), # Month flach machen
-                X_trace_train,                              # Trace Features (bereits flach)
-            ],
-            axis=1,
-        )
-        
-        # OSS anwenden (gibt Indizes der behaltenen Samples zurück)
-        _X_dummy, _y_dummy = oss.fit_resample(X_oss_train, y_is_deviant)
-        kept_indices = oss.sample_indices_
-        
-        # Alle 4 Input-Komponenten und Labels filtern
-        X_act_train = X_act_train[kept_indices]
-        X_res_train = X_res_train[kept_indices]
-        X_month_train = X_month_train[kept_indices]
-        X_trace_train = X_trace_train[kept_indices]
-        y_train = y_train[kept_indices]
-        case_ids_train = case_ids_train[kept_indices]  # Case IDs müssen mitgefiltert werden
-        
-        # Verteilung nach OSS erneut auswerten
-        y_is_deviant_res = (np.sum(y_train, axis=1) > 0).astype(int)
-        n_dev_after = int(np.sum(y_is_deviant_res))
-        n_conf_after = int(len(y_is_deviant_res) - n_dev_after)
-        print(f"  Resampled Train-Set: {len(y_train)} Samples.")
-        print(f"  Nach OSS - Deviant Traces: {n_dev_after}, Conforming Traces: {n_conf_after}")
-    except Exception as e:
-        # Falls OSS fehlschlägt (z.B. zu wenige Samples), verwende alle Daten
-        print(f"  [WARN] OSS fehlgeschlagen ({e}). Nutze volle Daten.")
-    
-    # 3. Validation Split (trace-basiert, 80% Train, 20% Validation)
-    # Das Training Set wird weiter aufgeteilt für Early Stopping
-    # Wichtig: Wieder trace-basiert, um Data Leakage zu vermeiden
-    unique_train_cases = np.unique(case_ids_train)
-    train_cases_final, val_cases = train_test_split(
-        unique_train_cases,
-        test_size=cfg.validation_split,  # 20% für Validation
-        random_state=cfg.random_state
-    )
-    
-    # Masken für finales Training Set und Validation Set
-    train_final_mask = np.isin(case_ids_train, train_cases_final)
-    val_mask = np.isin(case_ids_train, val_cases)
-    
-    # Final Training Set (80% des ursprünglichen Training Sets)
-    X_act_train_final = X_act_train[train_final_mask]
-    X_res_train_final = X_res_train[train_final_mask]
-    X_month_train_final = X_month_train[train_final_mask]
-    X_trace_train_final = X_trace_train[train_final_mask]
-    y_train_final = y_train[train_final_mask]
-    
-    # Validation Set (20% des ursprünglichen Training Sets)
-    X_act_val = X_act_train[val_mask]
-    X_res_val = X_res_train[val_mask]
-    X_month_val = X_month_train[val_mask]
-    X_trace_val = X_trace_train[val_mask]
-    y_val = y_train[val_mask]
-    
-    print(f"  Validation Split: {len(train_cases_final)} Traces Train, {len(val_cases)} Traces Val")
-    print(f"  Samples: {len(y_train_final)} Train, {len(y_val)} Val")
-
-    # 4. Klassen-Gewichte berechnen
-    # Die Gewichte werden auf dem finalen Training Set berechnet
-    beta_d = calculate_collective_weights(y_train_final, cfg.device)
-    
->>>>>>> Stashed changes
     # 5. Modell initialisieren
     device = torch.device(cfg.device)
     model = IDPCollectiveLSTM(
@@ -660,11 +533,7 @@ def train_collective_lstm(
             best_model_state = model.state_dict().copy()  # Gewichte kopieren
             print(f"    -> Bestes Modell gespeichert (Val Loss: {best_val_loss:.4f})")
         else:
-<<<<<<< Updated upstream
-            # ❌ Keine Verbesserung: Counter erhöhen
-=======
-            #  Keine Verbesserung: Counter erhöhen
->>>>>>> Stashed changes
+            # Keine Verbesserung: Counter erhöhen
             patience_counter += 1
             if patience_counter >= cfg.patience:
                 # Patience erreicht: Training stoppen
@@ -729,7 +598,6 @@ def main():
     3. Modell trainieren
     4. Modell und Vorhersagen speichern
     """
-<<<<<<< Updated upstream
     parser = argparse.ArgumentParser(
         description="Trainiert ein Collective LSTM-Modell für alle Deviation Types"
     )
@@ -754,8 +622,6 @@ def main():
     
     args = parser.parse_args()
     
-=======
->>>>>>> Stashed changes
     project_root = Path(__file__).resolve().parents[1]
     
     # Verzeichnisse bestimmen (rückwärtskompatibel)
@@ -817,12 +683,8 @@ def main():
     torch.save(model.state_dict(), model_path)
     
     # Vorhersage-Wahrscheinlichkeiten speichern (für Evaluation)
-<<<<<<< Updated upstream
     suffix = "_no_oss" if not cfg.use_oss else ""
     out_path = processed_dir / f"idp_collective_lstm_probs{suffix}.npz"
-=======
-    out_path = processed_dir / "idp_collective_lstm_probs.npz"
->>>>>>> Stashed changes
     np.savez_compressed(
         out_path,
         P_dev=P_dev_all,                    # Vorhersage-Wahrscheinlichkeiten

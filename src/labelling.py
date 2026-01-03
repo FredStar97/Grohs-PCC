@@ -302,12 +302,22 @@ def main():
     
     # Pfade bestimmen (rückwärtskompatibel)
     if args.log is None:
-        log_path = raw_dir / "finale.csv"
+        # Automatische Datei-Auswahl basierend auf Dataset
+        if args.dataset == "DomesticDeclarations":
+            log_path = raw_dir / "DomesticDeclarations.xes"
+        else:
+            # Standard: Helpdesk
+            log_path = raw_dir / "finale.csv"
     else:
         log_path = Path(args.log)
     
     if args.bpmn is None:
-        bpmn_path = raw_dir / "Helpdesk.bpmn"
+        # Automatische Datei-Auswahl basierend auf Dataset
+        if args.dataset == "DomesticDeclarations":
+            bpmn_path = raw_dir / "Model_ DomesticDeclarations.bpmn"
+        else:
+            # Standard: Helpdesk
+            bpmn_path = raw_dir / "Helpdesk.bpmn"
     else:
         bpmn_path = Path(args.bpmn)
     

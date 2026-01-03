@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -240,9 +241,47 @@ def main():
     Hauptfunktion: Lädt Encoding-Daten und exportiert sie als CSV,
     aufgeteilt nach Train/Validation/Test Sets.
     """
+    parser = argparse.ArgumentParser(
+        description="Exportiert Encoding-Daten als CSV, aufgeteilt nach Train/Validation/Test Sets"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Name des Datensatzes (für Input/Output-Verzeichnis). Standard: processed/ (rückwärtskompatibel)"
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default=None,
+        help="Input-Verzeichnis für Encoding-Daten. Standard: data/processed/ oder data/processed/{dataset}/"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output-Verzeichnis für CSV-Dateien. Standard: {input-dir}/encoding_csv/"
+    )
+    
+    args = parser.parse_args()
+    
     project_root = Path(__file__).resolve().parents[1]
-    processed_dir = project_root / "data" / "processed"
-    output_dir = processed_dir / "encoding_csv"
+    
+    # Input-Verzeichnis bestimmen (rückwärtskompatibel)
+    if args.input_dir is not None:
+        processed_dir = Path(args.input_dir)
+    elif args.dataset is not None:
+        processed_dir = project_root / "data" / "processed" / args.dataset
+    else:
+        # Rückwärtskompatibel: Standard-Verzeichnis
+        processed_dir = project_root / "data" / "processed"
+    
+    # Output-Verzeichnis bestimmen
+    if args.output_dir is not None:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = processed_dir / "encoding_csv"
+    
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)

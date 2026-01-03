@@ -45,12 +45,9 @@ class IDPSeparateLSTMConfig:
     # Early Stopping Parameter
     patience: int = 10
     validation_split: float = 0.2
-<<<<<<< Updated upstream
     
     # Undersampling
     use_oss: bool = True  # One-Sided Selection für Undersampling
-=======
->>>>>>> Stashed changes
     
     device: str = "cpu" 
     random_state: int = 42
@@ -267,7 +264,6 @@ def train_single_lstm_model(
         return None, np.zeros(n_samples, dtype=np.float32)
 
     # 4. Undersampling (OSS)
-<<<<<<< Updated upstream
     if cfg.use_oss:
         print(f"  Undersampling (OSS) auf Train-Set...")
         oss = OneSidedSelection(random_state=cfg.random_state, n_seeds_S=250, n_neighbors=7)
@@ -287,24 +283,6 @@ def train_single_lstm_model(
             pass
     else:
         print(f"  Kein Undersampling (OSS deaktiviert).")
-=======
-    print(f"  Undersampling (OSS) auf Train-Set...")
-    oss = OneSidedSelection(random_state=0, n_seeds_S=250, n_neighbors=7)
-    
-    try:
-        _X_dummy, _y_dummy = oss.fit_resample(X_trace_train, y_train)
-        kept_indices = oss.sample_indices_
-        
-        X_act_train = X_act_train[kept_indices]
-        X_res_train = X_res_train[kept_indices]
-        X_month_train = X_month_train[kept_indices]
-        X_trace_train = X_trace_train[kept_indices]
-        y_train = y_train[kept_indices]
-        case_ids_train = case_ids_train[kept_indices]  # Case IDs für resampled Daten
-    except Exception as e:
-        print(f"  [INFO] OSS fehlgeschlagen ({e}). Nutze volle Daten.")
-        pass
->>>>>>> Stashed changes
 
     print(f"  Train-Set nach Undersampling: {len(y_train)} Samples.")
     

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -36,10 +37,13 @@ def load_data(processed_dir: Path):
     case_ids = labels_data["case_ids"]          # (N,)
     dev_types = list(labels_data["dev_types"])  
 
-    # 2. Predictions laden
+    # 2. Predictions laden (prüfe beide Varianten: mit und ohne OSS)
     probs_path = processed_dir / "idp_separate_ffn_probs.npz"
     if not probs_path.exists():
-        raise FileNotFoundError(f"Datei nicht gefunden: {probs_path}. Bitte erst trainieren.")
+        # Fallback: versuche _no_oss Variante
+        probs_path = processed_dir / "idp_separate_ffn_probs_no_oss.npz"
+        if not probs_path.exists():
+            raise FileNotFoundError(f"Datei nicht gefunden: {processed_dir / 'idp_separate_ffn_probs.npz'} oder {probs_path}. Bitte erst Separate FFN trainieren.")
     
     probs_data = np.load(probs_path, allow_pickle=True)
     P_dev_all = probs_data["P_dev"]             # (N, m) - Wahrscheinlichkeiten
@@ -137,8 +141,34 @@ def evaluate_single_type(
 # =========================
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluiert das Separate FFN-Modell (Dev vs NoDev)"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Name des Datensatzes (für Input-Verzeichnis). Standard: processed/ (rückwärtskompatibel)"
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default=None,
+        help="Input-Verzeichnis für Labels und Predictions. Standard: data/processed/ oder data/processed/{dataset}/"
+    )
+    
+    args = parser.parse_args()
+    
     project_root = Path(__file__).resolve().parents[1]
-    processed_dir = project_root / "data" / "processed"
+    
+    # Verzeichnis bestimmen (rückwärtskompatibel)
+    if args.input_dir is not None:
+        processed_dir = Path(args.input_dir)
+    elif args.dataset is not None:
+        processed_dir = project_root / "data" / "processed" / args.dataset
+    else:
+        # Rückwärtskompatibel: Standard-Verzeichnis
+        processed_dir = project_root / "data" / "processed"
 
     print(f"Lade Daten aus: {processed_dir}")
     try:
