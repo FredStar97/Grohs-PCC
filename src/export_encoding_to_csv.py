@@ -26,7 +26,7 @@ def load_all_data(processed_dir: Path):
     
     Returns:
         X_ffn: FFN-Encoding (N × Feature-Dimension)
-        lstm_inputs: Dictionary mit LSTM-Inputs (X_act, X_res, X_month, X_trace)
+        lstm_inputs: Dictionary mit LSTM-Inputs (X_act, X_res, X_time, X_trace)
         case_ids: Case-IDs für jeden Prefix
     """
     # 1. FFN-Encoding laden
@@ -44,28 +44,37 @@ def load_all_data(processed_dir: Path):
     lstm_inputs = {
         "X_act": lstm_data["X_act_seq"],
         "X_res": lstm_data["X_res_seq"],
-        "X_month": lstm_data["X_month_seq"],
+        "X_time": lstm_data["X_time_seq"],
         "X_trace": lstm_data["X_trace"]
     }
     print(f"✓ LSTM-Encoding geladen:")
     print(f"  - Activities: {lstm_inputs['X_act'].shape}")
     print(f"  - Resources: {lstm_inputs['X_res'].shape}")
-    print(f"  - Month: {lstm_inputs['X_month'].shape}")
+    print(f"  - Time: {lstm_inputs['X_time'].shape}")
     print(f"  - Trace: {lstm_inputs['X_trace'].shape}")
     
-    # 3. Case-IDs laden
+    # 3. Case-IDs laden (verwende gefilterte Labels falls vorhanden, sonst Original)
+    encoding_labels_path = processed_dir / "encoding_labels.npz"
     labels_path = processed_dir / "idp_labels.npz"
-    if not labels_path.exists():
-        raise FileNotFoundError(f"Datei nicht gefunden: {labels_path}")
-    labels_data = np.load(labels_path, allow_pickle=True)
-    case_ids = labels_data["case_ids"]
-    print(f"✓ Case-IDs geladen: {len(case_ids)} Prefixe")
+    
+    if encoding_labels_path.exists():
+        # Verwende gefilterte Labels (nach Prefix-Filtering)
+        labels_data = np.load(encoding_labels_path, allow_pickle=True)
+        case_ids = labels_data["case_ids"]
+        print(f"✓ Case-IDs geladen (gefiltert): {len(case_ids)} Prefixe")
+    elif labels_path.exists():
+        # Fallback: Original Labels (rückwärtskompatibel)
+        labels_data = np.load(labels_path, allow_pickle=True)
+        case_ids = labels_data["case_ids"]
+        print(f"✓ Case-IDs geladen (original): {len(case_ids)} Prefixe")
+    else:
+        raise FileNotFoundError(f"Weder {encoding_labels_path} noch {labels_path} gefunden")
     
     # Sanity Check: Alle Arrays sollten gleich viele Zeilen haben
     n_samples = X_ffn.shape[0]
     assert lstm_inputs["X_act"].shape[0] == n_samples, "Shape mismatch bei Activities"
     assert lstm_inputs["X_res"].shape[0] == n_samples, "Shape mismatch bei Resources"
-    assert lstm_inputs["X_month"].shape[0] == n_samples, "Shape mismatch bei Month"
+    assert lstm_inputs["X_time"].shape[0] == n_samples, "Shape mismatch bei Time"
     assert lstm_inputs["X_trace"].shape[0] == n_samples, "Shape mismatch bei Trace"
     assert len(case_ids) == n_samples, "Shape mismatch bei Case-IDs"
     
@@ -177,11 +186,11 @@ def export_ffn_encoding(X_ffn: np.ndarray, case_ids: np.ndarray, masks: dict, ou
 def export_lstm_encoding(lstm_inputs: dict, case_ids: np.ndarray, masks: dict, output_dir: Path):
     """
     Exportiert LSTM-Encoding als CSV für Train/Val/Test Sets.
-    Alle Komponenten (Activities, Resources, Month, Trace) werden in einer Datei zusammengeführt.
+    Alle Komponenten (Activities, Resources, Time, Trace) werden in einer Datei zusammengeführt.
     Sequenzen werden flach gemacht (jede Position wird eine Spalte).
     
     Args:
-        lstm_inputs: Dictionary mit X_act, X_res, X_month, X_trace
+        lstm_inputs: Dictionary mit X_act, X_res, X_time, X_trace
         case_ids: Case-IDs für jeden Prefix
         masks: Dictionary mit 'train', 'val', 'test' Masken
         output_dir: Ausgabe-Verzeichnis
@@ -192,7 +201,7 @@ def export_lstm_encoding(lstm_inputs: dict, case_ids: np.ndarray, masks: dict, o
     component_info = {
         "X_act": "act",
         "X_res": "res",
-        "X_month": "month",
+        "X_time": "time",
         "X_trace": "trace"
     }
     

@@ -44,6 +44,7 @@ class IDPCollectiveFFNConfig:
     # Early Stopping Parameter
     patience: int = 10                    # Epochen ohne Verbesserung, bevor Training stoppt
     validation_split: float = 0.2         # Anteil des Training Sets für Validation (20%)
+    min_delta: float = 1e-3               # Minimale Verbesserung (0.001), damit Early Stopping als Verbesserung zählt
     
     # Undersampling
     use_oss: bool = True  # One-Sided Selection für Undersampling
@@ -86,6 +87,8 @@ def load_ffn_data(processed_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarr
     - CIBE-Features laden 
     - Labels und Metadaten laden
     - Prüfen, dass Anzahl der Prefixe übereinstimmt (X.shape[0] == y.shape[0])
+    - Unterstützt gefilterte Labels aus encoding_labels.npz (nach Prefix-Filtering)
+    
     Returns:
         X: Feature-Matrix (N Prefixe × Feature-Dimension) - CIBE-Encodings
         y: Label-Matrix (N Prefixe × Anzahl Deviation Types) - Multi-Label
@@ -98,16 +101,114 @@ def load_ffn_data(processed_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarr
     if not feat_path.exists():
         raise FileNotFoundError(f"{feat_path} nicht gefunden.")
     X = np.load(feat_path)
+    n_samples = X.shape[0]
 
     # Labels und Metadaten laden
-    label_path = processed_dir / "idp_labels.npz"
-    if not label_path.exists():
-        raise FileNotFoundError(f"{label_path} nicht gefunden.")
-    data = np.load(label_path, allow_pickle=True)
+    encoding_labels_path = processed_dir / "encoding_labels.npz"
+    idp_labels_path = processed_dir / "idp_labels.npz"
     
-    y = data["y"]              # Multi-Label Matrix
-    case_ids = data["case_ids"]  # Case-IDs für jeden Prefix
-    dev_types = list(data["dev_types"])  # Namen der Deviation Types
+    if not idp_labels_path.exists():
+        raise FileNotFoundError(f"{idp_labels_path} nicht gefunden.")
+    
+    # Lade Original-Labels (für dev_types, falls y_idp nicht vorhanden)
+    idp_data = np.load(idp_labels_path, allow_pickle=True)
+    dev_types = list(idp_data["dev_types"])  # Namen der Deviation Types
+    
+    # Prüfe, ob gefilterte Labels existieren
+    if encoding_labels_path.exists():
+        # Verwende gefilterte Labels (nach Prefix-Filtering)
+        encoding_data = np.load(encoding_labels_path, allow_pickle=True)
+        case_ids = encoding_data["case_ids"]
+        
+        # Prüfe, ob y_idp in encoding_labels.npz vorhanden ist
+        if "y_idp" in encoding_data:
+            # Verwende gefilterte Labels direkt
+            y = encoding_data["y_idp"]
+            print(f"✓ Verwende gefilterte Labels (y_idp) aus encoding_labels.npz: {len(case_ids)} Prefixe")
+        else:
+            # y_idp nicht vorhanden: Filtere y aus idp_labels.npz basierend auf (case_id, prefix_length) Paaren
+            y_all = idp_data["y"]
+            case_ids_all = idp_data["case_ids"]
+            prefix_lengths_all = idp_data.get("prefix_lengths", None)
+            prefix_lengths_filtered = encoding_data.get("prefix_lengths", None)
+            
+            # Verwende (case_id, prefix_length) Paare für exakte Zuordnung
+            if prefix_lengths_all is not None and prefix_lengths_filtered is not None:
+                # Erstelle Mapping: (case_id, prefix_length) -> Index
+                pair_to_index = {}
+                for i, (cid, plen) in enumerate(zip(case_ids_all, prefix_lengths_all)):
+                    pair = (str(cid), int(plen))
+                    if pair not in pair_to_index:
+                        pair_to_index[pair] = []
+                    pair_to_index[pair].append(i)
+                
+                # Finde Indizes für gefilterte Paare
+                filtered_indices = []
+                used_indices = set()
+                for cid, plen in zip(case_ids, prefix_lengths_filtered):
+                    pair = (str(cid), int(plen))
+                    if pair in pair_to_index:
+                        for idx in pair_to_index[pair]:
+                            if idx not in used_indices:
+                                filtered_indices.append(idx)
+                                used_indices.add(idx)
+                                break
+                
+                if len(filtered_indices) == n_samples:
+                    y = y_all[filtered_indices]
+                    print(f"✓ Gefilterte Labels (via (case_id, prefix_length) Mapping): {len(case_ids)} Prefixe")
+                else:
+                    raise ValueError(
+                        f"Konnte gefilterte Labels nicht korrekt mappen: "
+                        f"{len(filtered_indices)} Indizes gefunden, aber {n_samples} erwartet."
+                    )
+            else:
+                # Fallback: Verwende einfaches case_id Mapping (ohne prefix_length)
+                case_id_to_indices = {}
+                for i, cid in enumerate(case_ids_all):
+                    cid_str = str(cid)
+                    if cid_str not in case_id_to_indices:
+                        case_id_to_indices[cid_str] = []
+                    case_id_to_indices[cid_str].append(i)
+                
+                # Für jedes gefilterte case_id, nimm den ersten passenden Index
+                filtered_indices = []
+                used_indices = set()
+                for cid in case_ids:
+                    cid_str = str(cid)
+                    if cid_str in case_id_to_indices:
+                        for idx in case_id_to_indices[cid_str]:
+                            if idx not in used_indices:
+                                filtered_indices.append(idx)
+                                used_indices.add(idx)
+                                break
+                
+                if len(filtered_indices) == n_samples:
+                    y = y_all[filtered_indices]
+                    print(f"✓ Gefilterte Labels (via case_id Mapping): {len(case_ids)} Prefixe")
+                else:
+                    raise ValueError(
+                        f"Konnte gefilterte Labels nicht korrekt mappen: "
+                        f"{len(filtered_indices)} Indizes gefunden, aber {n_samples} erwartet. "
+                        f"Bitte stelle sicher, dass prefix_lengths in beiden Dateien vorhanden sind."
+                    )
+    else:
+        # Keine gefilterten Labels: Verwende Original-Labels
+        case_ids = idp_data["case_ids"]
+        y = idp_data["y"]
+        print(f"✓ Verwende Original-Labels aus idp_labels.npz: {len(case_ids)} Prefixe")
+    
+    # Sanity Check: Shapes müssen übereinstimmen
+    if y.shape[0] != n_samples:
+        raise ValueError(
+            f"Shape-Mismatch: X hat {n_samples} Samples, aber y hat {y.shape[0]} Samples. "
+            f"Bitte stelle sicher, dass encoding_labels.npz mit y_idp existiert oder "
+            f"dass die Labels korrekt gefiltert wurden."
+        )
+    if len(case_ids) != n_samples:
+        raise ValueError(
+            f"Shape-Mismatch: X hat {n_samples} Samples, aber case_ids hat {len(case_ids)} Samples."
+        )
 
     return X, y, case_ids, dev_types
 
@@ -146,9 +247,8 @@ class IDPCollectiveFFN(nn.Module):
         self.drop = nn.Dropout(cfg.dropout)         # Regularisierung
         
         # Output Layer: 1024 -> num_classes
+        # Gibt Logits zurück (MultiLabelSoftMarginLoss wendet intern Sigmoid an)
         self.head = nn.Linear(cfg.hidden_dim_2, num_classes)
-        # Sigmoid-Aktivierung für Multi-Label Klassifikation (gemäß Paper Fig. 6)
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -158,7 +258,8 @@ class IDPCollectiveFFN(nn.Module):
             x: Input Features (Batch × Feature-Dimension)
             
         Returns:
-            probs: Wahrscheinlichkeiten (Batch × num_classes) - Werte zwischen 0 und 1
+            logits: Unnormalisierte Vorhersagen (Batch × num_classes)
+                   Wird später mit Sigmoid zu Wahrscheinlichkeiten konvertiert
         """
         # Erster Block: Linear -> LayerNorm -> LeakyReLU
         x = self.act1(self.ln1(self.layer1(x)))
@@ -166,10 +267,9 @@ class IDPCollectiveFFN(nn.Module):
         # Zweiter Block: Linear -> LayerNorm -> LeakyReLU -> Dropout
         x = self.drop(self.act2(self.ln2(self.layer2(x))))
         
-        # Output: Logits -> Sigmoid -> Wahrscheinlichkeiten (gemäß Paper Fig. 6)
+        # Output: Logits (MultiLabelSoftMarginLoss wendet intern Sigmoid an)
         logits = self.head(x)
-        probs = self.sigmoid(logits)
-        return probs
+        return logits
 
 
 # =========================
@@ -356,11 +456,10 @@ def train_collective_model(
         cfg=cfg
     ).to(device)
     
-    # Loss-Funktion: Weighted Binary Cross-Entropy (WCEL)
-    # Da das Modell jetzt direkt Wahrscheinlichkeiten ausgibt (Sigmoid im Modell),
-    # verwenden wir BCELoss. Die Gewichte werden manuell angewendet.
+    # Loss-Funktion: Multi-Label Weighted Cross-Entropy (WCEL)
+    # MultiLabelSoftMarginLoss kombiniert Sigmoid + BCE Loss mit Klassen-Gewichten
     # Die Gewichte β_d gleichen Klassen-Ungleichgewichte aus
-    criterion = nn.BCELoss(reduction='none')  # reduction='none' für manuelle Gewichtung
+    criterion = nn.MultiLabelSoftMarginLoss(weight=beta_d)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     
     # 6. DataLoaders erstellen
@@ -383,11 +482,8 @@ def train_collective_model(
         for bx, by in train_loader:
             bx, by = bx.to(device), by.to(device)
             optimizer.zero_grad()      # Gradienten zurücksetzen
-            probs = model(bx)          # Forward Pass (gibt Wahrscheinlichkeiten aus)
-            # Gewichteter Loss: BCELoss pro Klasse, dann mit beta_d gewichtet
-            loss_per_sample = criterion(probs, by)  # (batch_size, num_classes)
-            weighted_loss = (loss_per_sample * beta_d.unsqueeze(0)).mean()  # Mittel über alle Klassen
-            loss = weighted_loss
+            logits = model(bx)         # Forward Pass (gibt Logits aus)
+            loss = criterion(logits, by)  # MultiLabelSoftMarginLoss mit Gewichten
             loss.backward()            # Gradienten berechnen
             optimizer.step()           # Gewichte aktualisieren
             epoch_train_loss += loss.item()
@@ -398,11 +494,8 @@ def train_collective_model(
         with torch.no_grad():  # Keine Gradienten berechnen (spart Speicher)
             for bx, by in val_loader:
                 bx, by = bx.to(device), by.to(device)
-                probs = model(bx)       # Modell gibt Wahrscheinlichkeiten aus
-                # Gewichteter Loss: BCELoss pro Klasse, dann mit beta_d gewichtet
-                loss_per_sample = criterion(probs, by)  # (batch_size, num_classes)
-                weighted_loss = (loss_per_sample * beta_d.unsqueeze(0)).mean()  # Mittel über alle Klassen
-                loss = weighted_loss
+                logits = model(bx)      # Modell gibt Logits aus
+                loss = criterion(logits, by)  # MultiLabelSoftMarginLoss mit Gewichten
                 epoch_val_loss += loss.item()
         
         # Durchschnittliche Loss-Werte berechnen
@@ -413,7 +506,8 @@ def train_collective_model(
         print(f"  Epoch {epoch}/{cfg.max_epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         
         # Early Stopping Check: Hat sich das Modell verbessert?
-        if avg_val_loss < best_val_loss:
+        # Nur als Verbesserung zählen, wenn Loss um mindestens min_delta gesunken ist
+        if avg_val_loss < best_val_loss - cfg.min_delta:
             # ✅ Verbesserung: Bestes Modell speichern
             best_val_loss = avg_val_loss
             patience_counter = 0
@@ -456,8 +550,9 @@ def train_collective_model(
     with torch.no_grad():
         for bx, _ in full_loader:
             bx = bx.to(device)
-            # Modell gibt direkt Wahrscheinlichkeiten aus (Sigmoid ist im Modell)
-            probs = model(bx)
+            logits = model(bx)  # Forward Pass (gibt Logits aus)
+            # Sigmoid für Multi-Label: Jede Klasse unabhängig (Wahrscheinlichkeit pro Type)
+            probs = torch.sigmoid(logits)
             probs_list.append(probs.cpu().numpy())
             
     # Alle Vorhersagen zusammenführen

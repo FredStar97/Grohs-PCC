@@ -48,6 +48,7 @@ class IDPSeparateFFNConfig:
     # Early Stopping Parameter
     patience: int = 10
     validation_split: float = 0.2
+    min_delta: float = 1e-3  # Minimale Verbesserung (0.001), damit Early Stopping als Verbesserung zählt
     
     # Undersampling
     use_oss: bool = True  # One-Sided Selection für Undersampling
@@ -79,30 +80,86 @@ class PrefixDataset(Dataset):
 
 def load_ffn_data(processed_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
     """
-    Lädt CIBE-Features (encoding_ffn.npy) und Labels (idp_labels.npz).
+    Lädt CIBE-Features (encoding_ffn.npy) und Labels (idp_labels.npz oder encoding_labels.npz).
     X: Features (N Prefixe × Features)
     y: Labels (N × m, m = Anzahl Deviation-Typen)
     case_ids: Case-IDs pro Prefix
     dev_types: Liste der Deviation-Typen
     Prüft, dass Anzahl der Prefixe übereinstimmt (X.shape[0] == y.shape[0])
+    Unterstützt gefilterte Labels aus encoding_labels.npz (nach Prefix-Filtering)
     """
     # 1. Features (CIBE)
     feat_path = processed_dir / "encoding_ffn.npy"
     if not feat_path.exists():
         raise FileNotFoundError(f"{feat_path} nicht gefunden. Bitte erst Encoding ausführen.")
     X = np.load(feat_path)
+    n_samples = X.shape[0]
 
     # 2. Labels & Meta
-    label_path = processed_dir / "idp_labels.npz"
-    if not label_path.exists():
-        raise FileNotFoundError(f"{label_path} nicht gefunden. Bitte erst Labeling ausführen.")
-    data = np.load(label_path, allow_pickle=True)
+    encoding_labels_path = processed_dir / "encoding_labels.npz"
+    idp_labels_path = processed_dir / "idp_labels.npz"
     
-    y = data["y"]              # (N, m)
-    case_ids = data["case_ids"]
-    dev_types = list(data["dev_types"])
+    if not idp_labels_path.exists():
+        raise FileNotFoundError(f"{idp_labels_path} nicht gefunden. Bitte erst Labeling ausführen.")
+    
+    # Lade Original-Labels (für dev_types)
+    idp_data = np.load(idp_labels_path, allow_pickle=True)
+    dev_types = list(idp_data["dev_types"])
+    
+    # Prüfe, ob gefilterte Labels existieren
+    if encoding_labels_path.exists():
+        encoding_data = np.load(encoding_labels_path, allow_pickle=True)
+        case_ids = encoding_data["case_ids"]
+        
+        if "y_idp" in encoding_data:
+            y = encoding_data["y_idp"]
+        else:
+            # Filtere y basierend auf (case_id, prefix_length) Paaren
+            y_all = idp_data["y"]
+            case_ids_all = idp_data["case_ids"]
+            prefix_lengths_all = idp_data.get("prefix_lengths", None)
+            prefix_lengths_filtered = encoding_data.get("prefix_lengths", None)
+            
+            if prefix_lengths_all is not None and prefix_lengths_filtered is not None:
+                # Erstelle Mapping: (case_id, prefix_length) -> Index
+                pair_to_index = {}
+                for i, (cid, plen) in enumerate(zip(case_ids_all, prefix_lengths_all)):
+                    pair = (str(cid), int(plen))
+                    if pair not in pair_to_index:
+                        pair_to_index[pair] = []
+                    pair_to_index[pair].append(i)
+                
+                # Finde Indizes für gefilterte Paare
+                filtered_indices = []
+                used_indices = set()
+                for cid, plen in zip(case_ids, prefix_lengths_filtered):
+                    pair = (str(cid), int(plen))
+                    if pair in pair_to_index:
+                        for idx in pair_to_index[pair]:
+                            if idx not in used_indices:
+                                filtered_indices.append(idx)
+                                used_indices.add(idx)
+                                break
+                
+                if len(filtered_indices) == n_samples:
+                    y = y_all[filtered_indices]
+                else:
+                    raise ValueError(
+                        f"Konnte gefilterte Labels nicht korrekt mappen: "
+                        f"{len(filtered_indices)} Indizes gefunden, aber {n_samples} erwartet."
+                    )
+            else:
+                raise ValueError(
+                    "prefix_lengths nicht in beiden Dateien vorhanden. "
+                    "Bitte stelle sicher, dass encoding_labels.npz mit prefix_lengths existiert."
+                )
+    else:
+        # Keine gefilterten Labels: Verwende Original-Labels
+        case_ids = idp_data["case_ids"]
+        y = idp_data["y"]
 
-    assert X.shape[0] == y.shape[0], "Feature- und Label-Anzahl stimmt nicht überein."
+    assert X.shape[0] == y.shape[0] == len(case_ids), \
+        f"Feature- und Label-Anzahl stimmt nicht überein: X={X.shape[0]}, y={y.shape[0]}, case_ids={len(case_ids)}"
     return X, y, case_ids, dev_types
 
 
@@ -157,37 +214,6 @@ class IDPFFN(nn.Module):
 # =========================
 # Training & Preprocessing (Section 5.2.1)
 # =========================
-
-def weighted_cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor, 
-                                alpha_cc: float, alpha_dc: float) -> torch.Tensor:
-    """
-    Gewichteter Cross-Entropy auf Logits (Softmax wird intern angewendet).
-    alpha_cc: Gewicht für Klasse 0 (Non-Deviating)
-    alpha_dc: Gewicht für Klasse 1 (Deviating)
-    
-    Die Softmax wird numerisch stabil mit log_softmax angewendet:
-    -log(softmax(logits)[correct_class]) = -log_softmax(logits)[correct_class]
-    """
-    device = logits.device
-    
-    # Gewichte: alpha_cc für Klasse 0, alpha_dc für Klasse 1
-    weights = torch.where(targets == 0, 
-                         torch.tensor(alpha_cc, device=device),
-                         torch.tensor(alpha_dc, device=device))
-    
-    # Cross-entropy: -log(softmax(logits)[correct_class])
-    # Numerisch stabil: log_softmax statt log(softmax(...))
-    log_probs = F.log_softmax(logits, dim=1)
-    
-    # Negative Log-Likelihood für die korrekte Klasse
-    # Gather: extrahiert log_prob für die korrekte Klasse pro Sample
-    loss_per_sample = -log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-    
-    # Gewichteter Loss
-    weighted_loss = weights * loss_per_sample
-    
-    return weighted_loss.mean()
-
 
 def train_single_classifier(
     dev_idx: int,
@@ -287,7 +313,11 @@ def train_single_classifier(
     device = torch.device(cfg.device)
     model = IDPFFN(input_dim=n_features, cfg=cfg).to(device)
     
-    # 6. Weighted Loss Function 
+    # 6. Weighted Loss Function
+    # Gewichteter Cross-Entropy Loss: alpha_cc für Klasse 0 (Non-Deviating), alpha_dc für Klasse 1 (Deviating)
+    weights = torch.tensor([cfg.alpha_cc, cfg.alpha_dc], dtype=torch.float32).to(device)
+    criterion = nn.CrossEntropyLoss(weight=weights)
+    
     # Adam-Optimizer: Optimizer, der die Modell-Gewichte beim Training automatisch so anpasst, dass der Loss kleiner wird
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     
@@ -315,8 +345,8 @@ def train_single_classifier(
             # Forward Pass (gibt Logits aus)
             logits = model(bx)
             
-            # Gewichteter Loss auf Logits (Softmax wird intern angewendet)
-            loss = weighted_cross_entropy_loss(logits, by, cfg.alpha_cc, cfg.alpha_dc)
+            # Gewichteter Loss auf Logits (CrossEntropyLoss wendet intern Softmax an)
+            loss = criterion(logits, by)
             
             loss.backward()
             optimizer.step()
@@ -330,7 +360,7 @@ def train_single_classifier(
                 bx, by = bx.to(device), by.to(device)
                 
                 logits = model(bx)
-                loss = weighted_cross_entropy_loss(logits, by, cfg.alpha_cc, cfg.alpha_dc)
+                loss = criterion(logits, by)
                 epoch_val_loss += loss.item()
         
         avg_train_loss = epoch_train_loss / len(train_loader)
@@ -340,7 +370,8 @@ def train_single_classifier(
         print(f"  Epoch {epoch}/{cfg.max_epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         
         # Early Stopping Check
-        if avg_val_loss < best_val_loss:
+        # Nur als Verbesserung zählen, wenn Loss um mindestens min_delta gesunken ist
+        if avg_val_loss < best_val_loss - cfg.min_delta:
             best_val_loss = avg_val_loss
             patience_counter = 0
             best_model_state = model.state_dict().copy()

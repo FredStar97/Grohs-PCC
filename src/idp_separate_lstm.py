@@ -12,6 +12,7 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from imblearn.under_sampling import OneSidedSelection
 
 
@@ -32,19 +33,20 @@ class IDPSeparateLSTMConfig:
     """
     embedding_dim: int = 16
     lstm_hidden_dim: int = 64
-    projection_dim: int = 64
+    projection_dim: int = 32
     
     alpha_cc: float = 1.0
     alpha_dc: float = 16.0
     dropout: float = 0.1
     
     batch_size: int = 256
-    lr: float = 1e-3
+    lr: float = 0.00001
     max_epochs: int = 300
     
     # Early Stopping Parameter
     patience: int = 10
     validation_split: float = 0.2
+    min_delta: float = 1e-3  # Minimale Verbesserung (0.001), damit Early Stopping als Verbesserung zählt
     
     # Undersampling
     use_oss: bool = True  # One-Sided Selection für Undersampling
@@ -68,13 +70,13 @@ class LSTMDataset(Dataset):
         self, 
         X_act: np.ndarray, 
         X_res: np.ndarray, 
-        X_month: np.ndarray, 
+        X_time: np.ndarray, 
         X_trace: np.ndarray, 
         y: np.ndarray
     ):
         self.X_act = torch.from_numpy(X_act.astype(np.int64))
         self.X_res = torch.from_numpy(X_res.astype(np.int64))
-        self.X_month = torch.from_numpy(X_month.astype(np.int64))
+        self.X_time = torch.from_numpy(X_time.astype(np.int64))
         self.X_trace = torch.from_numpy(X_trace.astype(np.float32))
         self.y = torch.from_numpy(y.astype(np.int64))
 
@@ -85,14 +87,15 @@ class LSTMDataset(Dataset):
         return (
             self.X_act[idx], 
             self.X_res[idx], 
-            self.X_month[idx], 
+            self.X_time[idx], 
             self.X_trace[idx]
         ), self.y[idx]
 
 
 def load_lstm_data(processed_dir: Path):
     """
-    Lädt Inputs (encoding_lstm.npz) und Labels (idp_labels.npz).
+    Lädt Inputs (encoding_lstm.npz) und Labels (idp_labels.npz oder encoding_labels.npz).
+    Unterstützt gefilterte Labels aus encoding_labels.npz (nach Prefix-Filtering).
     """
     enc_path = processed_dir / "encoding_lstm.npz"
     if not enc_path.exists():
@@ -101,17 +104,92 @@ def load_lstm_data(processed_dir: Path):
     inputs = {
         "X_act": enc_data["X_act_seq"],
         "X_res": enc_data["X_res_seq"],
-        "X_month": enc_data["X_month_seq"],
+        "X_time": enc_data["X_time_seq"],
         "X_trace": enc_data["X_trace"]
     }
     
-    lab_path = processed_dir / "idp_labels.npz"
-    if not lab_path.exists():
-        raise FileNotFoundError(f"{lab_path} nicht gefunden.")
-    lab_data = np.load(lab_path, allow_pickle=True)
-    y_all = lab_data["y"]
-    case_ids = lab_data["case_ids"]
-    dev_types = list(lab_data["dev_types"])
+    # Labels laden (unterstützt gefilterte Labels)
+    encoding_labels_path = processed_dir / "encoding_labels.npz"
+    idp_labels_path = processed_dir / "idp_labels.npz"
+    
+    if not idp_labels_path.exists():
+        raise FileNotFoundError(f"{idp_labels_path} nicht gefunden.")
+    
+    # Lade Original-Labels (für dev_types)
+    idp_data = np.load(idp_labels_path, allow_pickle=True)
+    dev_types = list(idp_data["dev_types"])
+    
+    # Prüfe, ob gefilterte Labels existieren
+    if encoding_labels_path.exists():
+        # Verwende gefilterte Labels (nach Prefix-Filtering)
+        encoding_data = np.load(encoding_labels_path, allow_pickle=True)
+        case_ids = encoding_data["case_ids"]
+        
+        # Prüfe, ob y_idp in encoding_labels.npz vorhanden ist
+        if "y_idp" in encoding_data:
+            # Verwende gefilterte Labels direkt
+            y_all = encoding_data["y_idp"]
+            print(f"✓ Verwende gefilterte Labels (y_idp) aus encoding_labels.npz: {len(case_ids)} Prefixe")
+        else:
+            # y_idp nicht vorhanden: Filtere y aus idp_labels.npz basierend auf (case_id, prefix_length) Paaren
+            y_all_raw = idp_data["y"]
+            case_ids_all = idp_data["case_ids"]
+            prefix_lengths_all = idp_data.get("prefix_lengths", None)
+            prefix_lengths_filtered = encoding_data.get("prefix_lengths", None)
+            
+            # Verwende (case_id, prefix_length) Paare für exakte Zuordnung
+            if prefix_lengths_all is not None and prefix_lengths_filtered is not None:
+                # Erstelle Mapping: (case_id, prefix_length) -> Index
+                pair_to_index = {}
+                for i, (cid, plen) in enumerate(zip(case_ids_all, prefix_lengths_all)):
+                    pair = (str(cid), int(plen))
+                    if pair not in pair_to_index:
+                        pair_to_index[pair] = []
+                    pair_to_index[pair].append(i)
+                
+                # Finde Indizes für gefilterte Paare
+                filtered_indices = []
+                used_indices = set()
+                for cid, plen in zip(case_ids, prefix_lengths_filtered):
+                    pair = (str(cid), int(plen))
+                    if pair in pair_to_index:
+                        for idx in pair_to_index[pair]:
+                            if idx not in used_indices:
+                                filtered_indices.append(idx)
+                                used_indices.add(idx)
+                                break
+                
+                if len(filtered_indices) == len(case_ids):
+                    y_all = y_all_raw[filtered_indices]
+                    print(f"✓ Gefilterte Labels (via (case_id, prefix_length) Mapping): {len(case_ids)} Prefixe")
+                else:
+                    raise ValueError(
+                        f"Konnte gefilterte Labels nicht korrekt mappen: "
+                        f"{len(filtered_indices)} Indizes gefunden, aber {len(case_ids)} erwartet."
+                    )
+            else:
+                raise ValueError(
+                    "prefix_lengths nicht in beiden Dateien vorhanden. "
+                    "Bitte stelle sicher, dass encoding_labels.npz mit prefix_lengths existiert."
+                )
+    else:
+        # Keine gefilterten Labels: Verwende Original-Labels
+        case_ids = idp_data["case_ids"]
+        y_all = idp_data["y"]
+        print(f"✓ Verwende Original-Labels aus idp_labels.npz: {len(case_ids)} Prefixe")
+    
+    # Sanity Check: Shapes müssen übereinstimmen
+    n_samples_inputs = inputs["X_act"].shape[0]
+    if y_all.shape[0] != n_samples_inputs:
+        raise ValueError(
+            f"Shape-Mismatch: Inputs haben {n_samples_inputs} Samples, aber y hat {y_all.shape[0]} Samples. "
+            f"Bitte stelle sicher, dass encoding_labels.npz mit y_idp existiert oder "
+            f"dass die Labels korrekt gefiltert wurden."
+        )
+    if len(case_ids) != n_samples_inputs:
+        raise ValueError(
+            f"Shape-Mismatch: Inputs haben {n_samples_inputs} Samples, aber case_ids hat {len(case_ids)} Samples."
+        )
     
     meta_path = processed_dir / "encoding_meta.json"
     with open(meta_path, "r") as f:
@@ -135,7 +213,7 @@ class IDPLSTM(nn.Module):
     Struktur:
     - Activities: Embedding -> LSTM -> Feed Forward -> Concat
     - Resources: Embedding -> LSTM -> Feed Forward -> Concat
-    - Month: Embedding -> LSTM -> Feed Forward -> Concat
+    - Time (MonthYear): Embedding -> LSTM -> Feed Forward -> Concat
     - Trace Attributes: Feed Forward -> Concat
     - Concat -> LayerNorm -> LeakyReLU -> Dropout -> Output Layer (size=2)
     """
@@ -159,11 +237,11 @@ class IDPLSTM(nn.Module):
         self.lstm_res = nn.LSTM(cfg.embedding_dim, cfg.lstm_hidden_dim, batch_first=True)
         self.ff_res = nn.Linear(cfg.lstm_hidden_dim, cfg.projection_dim)
         
-        # --- Branch 3: Month ---
+        # --- Branch 3: Time (MonthYear) ---
         # Input -> Embedding -> LSTM -> Feed Forward -> Concat
-        self.emb_month = nn.Embedding(len(meta["month_vocab"]) + 1, cfg.embedding_dim, padding_idx=0)
-        self.lstm_month = nn.LSTM(cfg.embedding_dim, cfg.lstm_hidden_dim, batch_first=True)
-        self.ff_month = nn.Linear(cfg.lstm_hidden_dim, cfg.projection_dim)
+        self.emb_time = nn.Embedding(len(meta["time_vocab"]) + 1, cfg.embedding_dim, padding_idx=0)
+        self.lstm_time = nn.LSTM(cfg.embedding_dim, cfg.lstm_hidden_dim, batch_first=True)
+        self.ff_time = nn.Linear(cfg.lstm_hidden_dim, cfg.projection_dim)
         
         # --- Branch 4: Trace Attributes ---
         # Input -> Feed Forward -> Concat
@@ -171,7 +249,7 @@ class IDPLSTM(nn.Module):
         
         # --- Concat & Output Head ---
         # Berechnung der Dimensionen für die Zusammenführung:
-        # 4x Projection Output (je 64): Activities, Resources, Month, Trace Attributes
+        # 4x Projection Output (je 64): Activities, Resources, Time (MonthYear), Trace Attributes
         concat_dim = cfg.projection_dim * 4 
         
         self.ln = nn.LayerNorm(concat_dim)
@@ -183,10 +261,10 @@ class IDPLSTM(nn.Module):
     Forward Pass für das Modell
     x_act: Activities
     x_res: Resources
-    x_month: Month
+    x_time: Time (MonthYear)
     x_trace: Trace Attributes
     """
-    def forward(self, x_act, x_res, x_month, x_trace):
+    def forward(self, x_act, x_res, x_time, x_trace):
         # Branch 1: Activities
         e_act = self.emb_act(x_act)
         _, (h_act, _) = self.lstm_act(e_act) 
@@ -198,10 +276,10 @@ class IDPLSTM(nn.Module):
         _, (h_res, _) = self.lstm_res(e_res)
         feat_res = self.ff_res(h_res[-1])
         
-        # Branch 3: Month
-        e_month = self.emb_month(x_month)
-        _, (h_month, _) = self.lstm_month(e_month)
-        feat_month = self.ff_month(h_month[-1])
+        # Branch 3: Time (MonthYear)
+        e_time = self.emb_time(x_time)
+        _, (h_time, _) = self.lstm_time(e_time)
+        feat_time = self.ff_time(h_time[-1])
         
         # Branch 4: Trace Attributes
         # Hier wird der Feed Forward Layer angewendet
@@ -209,7 +287,7 @@ class IDPLSTM(nn.Module):
         
         # Concat
         # Wir verbinden die projizierten Features aller Branches
-        concat = torch.cat([feat_act, feat_res, feat_month, feat_trace], dim=1)
+        concat = torch.cat([feat_act, feat_res, feat_time, feat_trace], dim=1)
         
         # Output Head (LayerNorm -> LeakyReLU -> Dropout -> Softmax/Logits)
         x = self.ln(concat)
@@ -251,10 +329,20 @@ def train_single_lstm_model(
     
     X_act_train = inputs["X_act"][train_mask]
     X_res_train = inputs["X_res"][train_mask]
-    X_month_train = inputs["X_month"][train_mask]
-    X_trace_train = inputs["X_trace"][train_mask]
+    X_time_train = inputs["X_time"][train_mask]
+    X_trace_train_raw = inputs["X_trace"][train_mask]
     y_train = y_dev[train_mask]
     case_ids_train = case_ids[train_mask]  # Für trace-basiertes Validation Split
+    
+    # StandardScaler für X_trace initialisieren und auf Train-Daten fitten
+    # (nach Split, um Data Leakage zu verhindern)
+    # Nur skalieren, wenn X_trace Features enthält (shape[1] > 0)
+    if X_trace_train_raw.shape[1] > 0:
+        trace_scaler = StandardScaler()
+        X_trace_train = trace_scaler.fit_transform(X_trace_train_raw)
+    else:
+        trace_scaler = None
+        X_trace_train = X_trace_train_raw
     
     print(f"  Trace Split: {len(train_cases)} Traces Train. (Total Samples: {len(y_train)})")
     
@@ -269,12 +357,28 @@ def train_single_lstm_model(
         oss = OneSidedSelection(random_state=cfg.random_state, n_seeds_S=250, n_neighbors=7)
         
         try:
-            _X_dummy, _y_dummy = oss.fit_resample(X_trace_train, y_train)
+            # OSS benötigt eine flache Feature-Repräsentation
+            # Daher werden alle 4 Input-Komponenten zu einem Feature-Vektor konkateniert
+            # (gemäß Paper Fig. 5: Alle Komponenten gehen in "Separate Undersampling")
+            n_samples_train = X_trace_train.shape[0]
+            X_oss_train = np.concatenate(
+                [
+                    X_act_train.reshape(n_samples_train, -1),   # Activities flach machen
+                    X_res_train.reshape(n_samples_train, -1),   # Resources flach machen
+                    X_time_train.reshape(n_samples_train, -1),  # Time flach machen
+                    X_trace_train,                              # Trace Features (bereits flach)
+                ],
+                axis=1,
+            )
+            
+            # OSS auf alle Features anwenden (gibt Indizes der behaltenen Samples zurück)
+            _X_dummy, _y_dummy = oss.fit_resample(X_oss_train, y_train)
             kept_indices = oss.sample_indices_
             
+            # Alle 4 Input-Komponenten und Labels filtern
             X_act_train = X_act_train[kept_indices]
             X_res_train = X_res_train[kept_indices]
-            X_month_train = X_month_train[kept_indices]
+            X_time_train = X_time_train[kept_indices]
             X_trace_train = X_trace_train[kept_indices]
             y_train = y_train[kept_indices]
             case_ids_train = case_ids_train[kept_indices]  # Case IDs für resampled Daten
@@ -300,14 +404,14 @@ def train_single_lstm_model(
     # Final Training Set
     X_act_train_final = X_act_train[train_final_mask]
     X_res_train_final = X_res_train[train_final_mask]
-    X_month_train_final = X_month_train[train_final_mask]
+    X_time_train_final = X_time_train[train_final_mask]
     X_trace_train_final = X_trace_train[train_final_mask]
     y_train_final = y_train[train_final_mask]
     
     # Validation Set
     X_act_val = X_act_train[val_mask]
     X_res_val = X_res_train[val_mask]
-    X_month_val = X_month_train[val_mask]
+    X_time_val = X_time_train[val_mask]
     X_trace_val = X_trace_train[val_mask]
     y_val = y_train[val_mask]
     
@@ -328,10 +432,10 @@ def train_single_lstm_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     
     # 8. DataLoaders
-    train_ds = LSTMDataset(X_act_train_final, X_res_train_final, X_month_train_final, X_trace_train_final, y_train_final)
+    train_ds = LSTMDataset(X_act_train_final, X_res_train_final, X_time_train_final, X_trace_train_final, y_train_final)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     
-    val_ds = LSTMDataset(X_act_val, X_res_val, X_month_val, X_trace_val, y_val)
+    val_ds = LSTMDataset(X_act_val, X_res_val, X_time_val, X_trace_val, y_val)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
     
     # 9. Training Loop mit Early Stopping
@@ -343,13 +447,13 @@ def train_single_lstm_model(
     for epoch in range(1, cfg.max_epochs + 1):
         # Training Phase
         epoch_train_loss = 0.0
-        for (batch_act, batch_res, batch_month, batch_trace), batch_y in train_loader:
+        for (batch_act, batch_res, batch_time, batch_trace), batch_y in train_loader:
             batch_act, batch_res = batch_act.to(device), batch_res.to(device)
-            batch_month, batch_trace = batch_month.to(device), batch_trace.to(device)
+            batch_time, batch_trace = batch_time.to(device), batch_trace.to(device)
             batch_y = batch_y.to(device)
             
             optimizer.zero_grad()
-            logits = model(batch_act, batch_res, batch_month, batch_trace)
+            logits = model(batch_act, batch_res, batch_time, batch_trace)
             loss = criterion(logits, batch_y)
             loss.backward()
             optimizer.step()
@@ -359,12 +463,12 @@ def train_single_lstm_model(
         model.eval()
         epoch_val_loss = 0.0
         with torch.no_grad():
-            for (batch_act, batch_res, batch_month, batch_trace), batch_y in val_loader:
+            for (batch_act, batch_res, batch_time, batch_trace), batch_y in val_loader:
                 batch_act, batch_res = batch_act.to(device), batch_res.to(device)
-                batch_month, batch_trace = batch_month.to(device), batch_trace.to(device)
+                batch_time, batch_trace = batch_time.to(device), batch_trace.to(device)
                 batch_y = batch_y.to(device)
                 
-                logits = model(batch_act, batch_res, batch_month, batch_trace)
+                logits = model(batch_act, batch_res, batch_time, batch_trace)
                 loss = criterion(logits, batch_y)
                 epoch_val_loss += loss.item()
         
@@ -375,7 +479,8 @@ def train_single_lstm_model(
         print(f"  Epoch {epoch}/{cfg.max_epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         
         # Early Stopping Check
-        if avg_val_loss < best_val_loss:
+        # Nur als Verbesserung zählen, wenn Loss um mindestens min_delta gesunken ist
+        if avg_val_loss < best_val_loss - cfg.min_delta:
             best_val_loss = avg_val_loss
             patience_counter = 0
             best_model_state = model.state_dict().copy()
@@ -403,17 +508,22 @@ def train_single_lstm_model(
         print(f"  [WARN] Kein bestes Modell gefunden, nutze aktuelles Modell")
             
     # 11. Prediction
-    full_ds = LSTMDataset(inputs["X_act"], inputs["X_res"], inputs["X_month"], inputs["X_trace"], y_dev)
+    # X_trace für alle Samples skalieren (mit dem auf Train gefitteten Scaler)
+    if trace_scaler is not None:
+        X_trace_all_scaled = trace_scaler.transform(inputs["X_trace"])
+    else:
+        X_trace_all_scaled = inputs["X_trace"]
+    full_ds = LSTMDataset(inputs["X_act"], inputs["X_res"], inputs["X_time"], X_trace_all_scaled, y_dev)
     full_loader = DataLoader(full_ds, batch_size=cfg.batch_size, shuffle=False)
     
     model.eval()
     probs_list = []
     with torch.no_grad():
-        for (b_act, b_res, b_month, b_trace), _ in full_loader:
+        for (b_act, b_res, b_time, b_trace), _ in full_loader:
             b_act, b_res = b_act.to(device), b_res.to(device)
-            b_month, b_trace = b_month.to(device), b_trace.to(device)
+            b_time, b_trace = b_time.to(device), b_trace.to(device)
             
-            logits = model(b_act, b_res, b_month, b_trace)
+            logits = model(b_act, b_res, b_time, b_trace)
             probs = torch.softmax(logits, dim=1)
             probs_list.append(probs[:, 1].cpu().numpy())
             

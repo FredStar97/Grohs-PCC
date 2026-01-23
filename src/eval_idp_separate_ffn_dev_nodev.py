@@ -26,18 +26,9 @@ TEST_SIZE = 1.0 / 3.0  # Paper: "split ... into train (2/3) and test (1/3)"
 def load_data(processed_dir: Path):
     """
     Lädt die Ground Truth (Labels) und die Vorhersagen (Probabilities).
+    Unterstützt gefilterte Labels aus encoding_labels.npz (nach Prefix-Filtering).
     """
-    # 1. True Labels laden
-    labels_path = processed_dir / "idp_labels.npz"
-    if not labels_path.exists():
-        raise FileNotFoundError(f"Datei nicht gefunden: {labels_path}")
-    
-    labels_data = np.load(labels_path, allow_pickle=True)
-    y_true_all = labels_data["y"]               # (N, m)
-    case_ids = labels_data["case_ids"]          # (N,)
-    dev_types = list(labels_data["dev_types"])  
-
-    # 2. Predictions laden (prüfe beide Varianten: mit und ohne OSS)
+    # 1. Predictions laden (prüfe beide Varianten: mit und ohne OSS)
     probs_path = processed_dir / "idp_separate_ffn_probs.npz"
     if not probs_path.exists():
         # Fallback: versuche _no_oss Variante
@@ -47,18 +38,166 @@ def load_data(processed_dir: Path):
     
     probs_data = np.load(probs_path, allow_pickle=True)
     P_dev_all = probs_data["P_dev"]             # (N, m) - Wahrscheinlichkeiten
+    case_ids_pred = probs_data.get("case_ids", None)  # Case-IDs aus Predictions (falls vorhanden)
+    n_samples_pred = P_dev_all.shape[0]
+
+    # 2. Labels laden (unterstützt gefilterte Labels)
+    encoding_labels_path = processed_dir / "encoding_labels.npz"
+    idp_labels_path = processed_dir / "idp_labels.npz"
     
-    # case_ids aus Predictions verwenden (falls vorhanden), sonst aus Labels
-    # Dies stellt sicher, dass die Reihenfolge mit den Predictions übereinstimmt
-    if "case_ids" in probs_data:
-        case_ids_probs = probs_data["case_ids"]
-        # Sicherstellen, dass case_ids übereinstimmen
-        assert np.array_equal(case_ids, case_ids_probs), "case_ids stimmen nicht überein zwischen Labels und Predictions!"
-        case_ids = case_ids_probs
+    if not idp_labels_path.exists():
+        raise FileNotFoundError(f"Datei nicht gefunden: {idp_labels_path}")
+    
+    # Lade Original-Labels (für dev_types)
+    idp_data = np.load(idp_labels_path, allow_pickle=True)
+    dev_types = list(idp_data["dev_types"])
+    
+    # Prüfe, ob gefilterte Labels existieren
+    if encoding_labels_path.exists():
+        # Verwende gefilterte Labels (nach Prefix-Filtering)
+        encoding_data = np.load(encoding_labels_path, allow_pickle=True)
+        case_ids_filtered = encoding_data["case_ids"]
+        
+        # Prüfe, ob y_idp in encoding_labels.npz vorhanden ist
+        if "y_idp" in encoding_data:
+            # Verwende gefilterte Labels direkt
+            y_filtered = encoding_data["y_idp"]
+            print(f"✓ Verwende gefilterte Labels (y_idp) aus encoding_labels.npz: {len(case_ids_filtered)} Prefixe")
+        else:
+            # y_idp nicht vorhanden: Filtere y aus idp_labels.npz basierend auf (case_id, prefix_length) Paaren
+            y_all = idp_data["y"]
+            case_ids_all = idp_data["case_ids"]
+            prefix_lengths_all = idp_data.get("prefix_lengths", None)
+            prefix_lengths_filtered = encoding_data.get("prefix_lengths", None)
+            
+            # Verwende (case_id, prefix_length) Paare für exakte Zuordnung
+            if prefix_lengths_all is not None and prefix_lengths_filtered is not None:
+                # Erstelle Mapping: (case_id, prefix_length) -> Index
+                pair_to_index = {}
+                for i, (cid, plen) in enumerate(zip(case_ids_all, prefix_lengths_all)):
+                    pair = (str(cid), int(plen))
+                    if pair not in pair_to_index:
+                        pair_to_index[pair] = []
+                    pair_to_index[pair].append(i)
+                
+                # Finde Indizes für gefilterte Paare
+                filtered_indices = []
+                used_indices = set()
+                for cid, plen in zip(case_ids_filtered, prefix_lengths_filtered):
+                    pair = (str(cid), int(plen))
+                    if pair in pair_to_index:
+                        for idx in pair_to_index[pair]:
+                            if idx not in used_indices:
+                                filtered_indices.append(idx)
+                                used_indices.add(idx)
+                                break
+                
+                if len(filtered_indices) == len(case_ids_filtered):
+                    y_filtered = y_all[filtered_indices]
+                    print(f"✓ Gefilterte Labels (via (case_id, prefix_length) Mapping): {len(case_ids_filtered)} Prefixe")
+                else:
+                    raise ValueError(
+                        f"Konnte gefilterte Labels nicht korrekt mappen: "
+                        f"{len(filtered_indices)} Indizes gefunden, aber {len(case_ids_filtered)} erwartet."
+                    )
+            else:
+                # Fallback: Verwende einfaches case_id Mapping (ohne prefix_length)
+                case_id_to_indices = {}
+                for i, cid in enumerate(case_ids_all):
+                    cid_str = str(cid)
+                    if cid_str not in case_id_to_indices:
+                        case_id_to_indices[cid_str] = []
+                    case_id_to_indices[cid_str].append(i)
+                
+                # Für jedes gefilterte case_id, nimm den ersten passenden Index
+                filtered_indices = []
+                used_indices = set()
+                for cid in case_ids_filtered:
+                    cid_str = str(cid)
+                    if cid_str in case_id_to_indices:
+                        for idx in case_id_to_indices[cid_str]:
+                            if idx not in used_indices:
+                                filtered_indices.append(idx)
+                                used_indices.add(idx)
+                                break
+                
+                if len(filtered_indices) == len(case_ids_filtered):
+                    y_filtered = y_all[filtered_indices]
+                    print(f"✓ Gefilterte Labels (via case_id Mapping): {len(case_ids_filtered)} Prefixe")
+                else:
+                    raise ValueError(
+                        f"Konnte gefilterte Labels nicht korrekt mappen: "
+                        f"{len(filtered_indices)} Indizes gefunden, aber {len(case_ids_filtered)} erwartet. "
+                        f"Bitte stelle sicher, dass prefix_lengths in beiden Dateien vorhanden sind."
+                    )
+        
+        # Verwende case_ids aus Predictions (falls vorhanden), sonst aus encoding_labels.npz
+        if case_ids_pred is not None:
+            case_ids = case_ids_pred
+        else:
+            case_ids = case_ids_filtered
+        y_true_all = y_filtered
+    else:
+        # Keine gefilterten Labels: Verwende Original-Labels
+        # Falls case_ids in Predictions vorhanden, verwende diese für Filtering
+        if case_ids_pred is not None:
+            # Filtere Labels basierend auf case_ids aus Predictions
+            case_ids_all = idp_data["case_ids"]
+            y_all = idp_data["y"]
+            
+            # Erstelle Mapping: case_id -> Indizes
+            case_id_to_indices = {}
+            for i, cid in enumerate(case_ids_all):
+                cid_str = str(cid)
+                if cid_str not in case_id_to_indices:
+                    case_id_to_indices[cid_str] = []
+                case_id_to_indices[cid_str].append(i)
+            
+            # Finde Indizes für case_ids aus Predictions
+            filtered_indices = []
+            used_indices = set()
+            for cid in case_ids_pred:
+                cid_str = str(cid)
+                if cid_str in case_id_to_indices:
+                    for idx in case_id_to_indices[cid_str]:
+                        if idx not in used_indices:
+                            filtered_indices.append(idx)
+                            used_indices.add(idx)
+                            break
+            
+            if len(filtered_indices) == n_samples_pred:
+                y_true_all = y_all[filtered_indices]
+                case_ids = case_ids_pred
+                print(f"✓ Labels gefiltert basierend auf case_ids aus Predictions: {n_samples_pred} Prefixe")
+            else:
+                # Fallback: Verwende alle Original-Labels
+                y_true_all = y_all
+                case_ids = case_ids_all
+                print(f"✓ Verwende Original-Labels aus idp_labels.npz: {len(case_ids)} Prefixe")
+        else:
+            # Keine case_ids in Predictions: Verwende alle Original-Labels
+            y_true_all = idp_data["y"]
+            case_ids = idp_data["case_ids"]
+            print(f"✓ Verwende Original-Labels aus idp_labels.npz: {len(case_ids)} Prefixe")
 
     # Sanity Check Shapes
-    assert y_true_all.shape == P_dev_all.shape, "Shape Mismatch zwischen Labels und Predictions!"
-    assert len(case_ids) == y_true_all.shape[0], "Anzahl case_ids stimmt nicht mit Anzahl Samples überein!"
+    if y_true_all.shape[0] != P_dev_all.shape[0]:
+        raise AssertionError(
+            f"Shape Mismatch! Labels: {y_true_all.shape}, Preds: {P_dev_all.shape}. "
+            f"Bitte stelle sicher, dass encoding_labels.npz mit y_idp existiert oder "
+            f"dass die Labels korrekt gefiltert wurden."
+        )
+    if len(case_ids) != P_dev_all.shape[0]:
+        raise AssertionError(
+            f"Shape Mismatch! case_ids: {len(case_ids)}, Preds: {P_dev_all.shape[0]}. "
+            f"Bitte stelle sicher, dass case_ids in idp_separate_ffn_probs.npz gespeichert wurden."
+        )
+    
+    # Prüfe, ob Anzahl der Deviation Types übereinstimmt
+    if y_true_all.shape[1] != P_dev_all.shape[1]:
+        raise AssertionError(
+            f"Anzahl Deviation Types stimmt nicht überein! Labels: {y_true_all.shape[1]}, Preds: {P_dev_all.shape[1]}"
+        )
     
     return y_true_all, P_dev_all, case_ids, dev_types
 

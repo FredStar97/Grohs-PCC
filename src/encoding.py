@@ -21,7 +21,16 @@ CASE_COL = "Case ID"
 ACT_COL = "Activity"
 RES_COL = "Resource"
 TIME_COL = "Complete Timestamp"
-MONTH_COL = "Month"  # wird aus TIME_COL abgeleitet
+MONTHYEAR_COL = "MonthYear"  # wird aus TIME_COL abgeleitet: "MM_YYYY"
+
+# Weekday-Features (BPDP-Verhalten)
+# Encoding-Unterschied:
+# - LSTM: Ordinal-IDs (weekday_start_id, weekday_end_id) als 2 numerische Trace-Features, später per StandardScaler skaliert
+# - FFN: One-Hot-Dummies (weekday_start_Monday, ..., weekday_end_Sunday) via pd.get_dummies
+# weekday_end wird nur bei vollständigem Trace gesetzt (BPDP-Gating, verhindert Data Leakage)
+WEEKDAY_START_COL = "weekday_start"
+WEEKDAY_END_COL = "weekday_end"
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
 # ============================================================
@@ -33,7 +42,7 @@ class EncodingMeta:
     max_prefix_len: int # maximale Länge eines Präfixes
     activity_vocab: Dict[str, int] # Vokabular für Activities       
     resource_vocab: Dict[str, int] # Vokabular für Resources
-    month_vocab: Dict[int, int] # Vokabular für Months
+    time_vocab: Dict[str, int] # Vokabular für MonthYear-Strings
     trace_numeric_cols: List[str] # Liste der numerischen Trace-Attribute
     trace_categorical_cols: List[str] # Liste der kategorialen Trace-Attribute
     trace_cat_vocabs: Dict[str, Dict[str, int]] # Vokabulare für kategoriale Trace-Attribute
@@ -95,12 +104,59 @@ def load_event_log_to_df(log_path: str) -> pd.DataFrame:
     if RES_COL not in df.columns:
         raise ValueError(f"Required event attribute column '{RES_COL}' not found in {log_path}")
 
-    # Timestamp parsen und Month-Feature erzeugen
+    # Timestamp parsen und MonthYear-Feature erzeugen (BPDP-Format: ohne führende Null)
     df[TIME_COL] = pd.to_datetime(df[TIME_COL])
-    df[MONTH_COL] = df[TIME_COL].dt.month.astype("int16")
+    df[MONTHYEAR_COL] = df[TIME_COL].dt.month.astype(str) + "_" + df[TIME_COL].dt.year.astype(str)
+
+    # Case-ID Robustheit: Immer als String behandeln
+    df[CASE_COL] = df[CASE_COL].astype(str)
 
     # Nach Case und Zeit sortieren, damit die Event-Reihenfolge eindeutig ist
     df = df.sort_values([CASE_COL, TIME_COL]).reset_index(drop=True)
+
+    # Missing-Value-Behandlung: Fehlende Werte in Event-Attributen auf "No" setzen
+    # (vor Vokabularbau, verhindert "nan" als Kategorie)
+    for col in [ACT_COL, RES_COL, MONTHYEAR_COL]:
+        df[col] = df[col].fillna("No").astype(str)
+        # Ersetze explizit "nan" Strings (falls vorhanden)
+        df[col] = df[col].replace("nan", "No")
+
+    return df
+
+
+def add_weekday_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fügt weekday_start und weekday_end als case-konstante Features hinzu.
+    
+    weekday_start = Wochentag des ersten Events je Case
+    weekday_end = Wochentag des letzten Events je Case
+    
+    Werte: Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday
+    Falls Timestamp fehlt: "<UNK>"
+    
+    Voraussetzung: DataFrame ist bereits nach [Case ID, Complete Timestamp] sortiert.
+    """
+    def get_weekday_name(ts):
+        """Konvertiert Timestamp zu Wochentag-String."""
+        if pd.isna(ts):
+            return "<UNK>"
+        try:
+            return WEEKDAY_NAMES[ts.weekday()]
+        except (AttributeError, IndexError):
+            return "<UNK>"
+    
+    # Gruppiere nach Case ID und bestimme erstes/letztes Event
+    first_events = df.groupby(CASE_COL, sort=False).first()
+    last_events = df.groupby(CASE_COL, sort=False).last()
+    
+    # Weekday-Mapping
+    weekday_start_map = first_events[TIME_COL].apply(get_weekday_name)
+    weekday_end_map = last_events[TIME_COL].apply(get_weekday_name)
+    
+    # Als neue Spalten hinzufügen (case-konstant)
+    df[WEEKDAY_START_COL] = df[CASE_COL].map(weekday_start_map)
+    df[WEEKDAY_END_COL] = df[CASE_COL].map(weekday_end_map)
+    
     return df
 
 
@@ -121,27 +177,69 @@ def load_raw_df(csv_path: str) -> pd.DataFrame:
 # Trace-Attribute erkennen (alle Attribute, die pro Case konstant sind)
 # ============================================================
 # Spalten, die bei Trace-Attribute-Erkennung ignoriert werden (Event-Attribute keine Trace-Attribute)
+# Weekday-Features werden separat behandelt (BPDP-Gating)
 IGNORE_COLS = {
     CASE_COL,
     ACT_COL,
     RES_COL,
     TIME_COL,
-    MONTH_COL,
+    MONTHYEAR_COL,
+    WEEKDAY_START_COL,
+    WEEKDAY_END_COL,
+    "Variant index",  # Explizit ignorieren: Variant index soll nicht als Trace-Attribut verwendet werden
 }
+
+# Schlüsselwörter für ID-/Leakage-verdächtige Spalten (case-insensitive)
+ID_LEAKAGE_KEYWORDS = {"id", "case", "trace", "number", "nr", "key", "uid", "guid", "index", "idx"}
+
+
+def _is_id_leakage_column(col: str, df: pd.DataFrame, n_cases: int) -> bool:
+    """
+    Prüft, ob eine Spalte ID-/Leakage-verdächtig ist.
+    
+    Kriterien:
+    a) Spaltenname enthält (case-insensitive) ein ID-Keyword
+    b) Sehr hohe Kardinalität (> 0.9 * #cases) bei string/integer-Typ
+    """
+    col_lower = col.lower()
+    
+    # Kriterium a): Spaltenname enthält ID-Keyword
+    for keyword in ID_LEAKAGE_KEYWORDS:
+        if keyword in col_lower:
+            return True
+    
+    # Kriterium b): Hohe Kardinalität
+    n_unique = df[col].nunique()
+    if n_unique > 0.9 * n_cases:
+        if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_integer_dtype(df[col]):
+            return True
+    
+    return False
 
 
 def detect_trace_attributes(
     df: pd.DataFrame,
+    exclude_categorical: bool = True,
+    enable_id_leakage_filter: bool = False,
 ) -> Tuple[List[str], List[str], Dict[str, Dict[str, int]]]:
     """
     Schritte:
     1. Kandidaten: alle Spalten außer IGNORE_COLS
     2. Gruppieren nach Case ID
     3. Für jede Spalte prüfen, ob pro Case nur ein Wert vorkommt (max_nunique == 1)
-    4. Falls ja: numerisch → trace_numeric, sonst → trace_categorical mit Vokabular
-    5. Rückgabe: Listen für numerisch/kategorial und Vokabulare für kategoriale Attribute.
+    4. Filter: Spalten, die über den gesamten Datensatz konstant sind, werden ignoriert
+    5. Falls ja: numerisch → trace_numeric, sonst → trace_categorical mit Vokabular
+    6. Optional: Filtere ID-/Leakage-verdächtige Spalten heraus (nur wenn enable_id_leakage_filter=True)
+    7. Vokabular für kategoriale Attribute: "<UNK>":0, echte Werte ab 1
+    8. Rückgabe: Listen für numerisch/kategorial und Vokabulare für kategoriale Attribute.
+    
+    Args:
+        df: DataFrame mit Event-Log Daten
+        exclude_categorical: Wenn True, werden kategorische Trace-Attribute ignoriert (Default: True)
+        enable_id_leakage_filter: Wenn True, werden ID-/Leakage-verdächtige Spalten gefiltert (Default: False)
     """
     candidates = [c for c in df.columns if c not in IGNORE_COLS]
+    n_cases = df[CASE_COL].nunique()
 
     group = df.groupby(CASE_COL, sort=False)
 
@@ -156,15 +254,30 @@ def detect_trace_attributes(
             # Dann ist es ein Event-Attribut und gehört nicht zu den Trace-Attributen
             continue
 
+        # Filter: Spalten, die über den gesamten Datensatz konstant sind, ignorieren
+        global_nunique = df[col].nunique(dropna=False)
+        if global_nunique <= 1:
+            print(f"  -> Konstante Spalte gefiltert (nur {global_nunique} Wert(e) im Datensatz): {col}")
+            continue
+
+        # ID-/Leakage-Filter nur anwenden, wenn explizit aktiviert
+        if enable_id_leakage_filter and _is_id_leakage_column(col, df, n_cases):
+            print(f"  -> ID-/Leakage-Spalte gefiltert: {col}")
+            continue
+
         if pd.api.types.is_numeric_dtype(df[col]):
             trace_numeric.append(col)
         else:
-            trace_categorical.append(col)
-            # Vokabular aller vorkommenden Ausprägungen (für One-Hot)
-            values = group[col].first().dropna().astype(str).unique()
-            trace_cat_vocabs[col] = {
-                v: i for i, v in enumerate(sorted(values))
-            }
+            # Kategorische Attribute nur hinzufügen, wenn nicht ausgeschlossen
+            if not exclude_categorical:
+                trace_categorical.append(col)
+                # Vokabular: "<UNK>":0, dann echte Werte ab 1
+                # Filtere "nan" Strings heraus
+                values = group[col].first().dropna().astype(str).unique()
+                values = sorted([v for v in values if v.lower() != "nan"])
+                trace_cat_vocabs[col] = {"<UNK>": 0, **{v: i + 1 for i, v in enumerate(values)}}
+            else:
+                print(f"  -> Kategorische Spalte ignoriert: {col}")
 
     return trace_numeric, trace_categorical, trace_cat_vocabs
 
@@ -173,30 +286,48 @@ def detect_trace_attributes(
 # Vokabulare & Meta-Informationen
 # ============================================================
 
-def build_encoding_meta(df: pd.DataFrame) -> EncodingMeta:
+def build_encoding_meta(
+    df: pd.DataFrame,
+    include_categorical_trace_attrs: bool = False,
+    enable_id_leakage_filter: bool = False,
+) -> EncodingMeta:
     """
     Schritte:
-    1. Activity-Vokabular: eindeutige Werte → IDs (1, 2, 3, ...)
-    2. Resource-Vokabular: eindeutige Werte → IDs (1, 2, 3, ...)
-    3. Month-Vokabular: eindeutige Werte → IDs (1, 2, 3, ...)
+    1. Activity-Vokabular: "No"-Token (ID=0), dann echte Werte (ab ID=1)
+    2. Resource-Vokabular: "No"-Token (ID=0), dann echte Werte (ab ID=1)
+    3. Time-Vokabular: "No"-Token (ID=0), dann echte Werte (ab ID=1)
     4. Trace-Attribute via detect_trace_attributes() 
+       - Nur numerische Trace-Attribute (kategorische werden standardmäßig ignoriert)
+       - Spalten, die über den gesamten Datensatz konstant sind, werden entfernt
     5. max_prefix_len: maximale Anzahl Events pro Case (später wichtig für Padding-Länge bei LSTM-Sequenzen)
     6. Rückgabe: EncodingMeta-Objekt. (für das Encoding benötigte Metadaten)
+    
+    Args:
+        df: DataFrame mit Event-Log Daten
+        include_categorical_trace_attrs: Wenn True, werden kategorische Trace-Attribute einbezogen (Default: False)
+        enable_id_leakage_filter: Wenn True, werden ID-/Leakage-verdächtige Spalten gefiltert (Default: False)
     """
-    # Activity-Vokabular (Padding-ID = 0, daher Start bei 1)
-    act_values = df[ACT_COL].astype(str).unique()
-    activity_vocab = {v: i + 1 for i, v in enumerate(sorted(act_values))}
+    # Activity-Vokabular: "No"-Token für Padding (ID=0), danach echte Werte (ab ID=1)
+    # Entferne "No" aus echten Werten, um Überschreiben des Padding-Tokens zu verhindern
+    act_values = sorted(set(df[ACT_COL].astype(str).unique()) - {"No"})
+    activity_vocab = {"No": 0, **{v: i + 1 for i, v in enumerate(act_values)}}
 
-    # Resource-Vokabular
-    res_values = df[RES_COL].astype(str).unique()
-    resource_vocab = {v: i + 1 for i, v in enumerate(sorted(res_values))}
+    # Resource-Vokabular: "No"-Token für Padding (ID=0), danach echte Werte (ab ID=1)
+    # Entferne "No" aus echten Werten, um Überschreiben des Padding-Tokens zu verhindern
+    res_values = sorted(set(df[RES_COL].astype(str).unique()) - {"No"})
+    resource_vocab = {"No": 0, **{v: i + 1 for i, v in enumerate(res_values)}}
 
-    # Month-Vokabular (1..12) ebenfalls mit Startindex 1
-    months = sorted(int(m) for m in df[MONTH_COL].unique())
-    month_vocab = {m: i + 1 for i, m in enumerate(months)}
+    # Time-Vokabular: "No"-Token für Padding (ID=0), danach echte Werte (ab ID=1)
+    # Entferne "No" aus echten Werten, um Überschreiben des Padding-Tokens zu verhindern
+    time_values = sorted(set(df[MONTHYEAR_COL].astype(str).unique()) - {"No"})
+    time_vocab = {"No": 0, **{v: i + 1 for i, v in enumerate(time_values)}}
 
     # Trace-Attribute
-    trace_numeric, trace_categorical, trace_cat_vocabs = detect_trace_attributes(df)
+    trace_numeric, trace_categorical, trace_cat_vocabs = detect_trace_attributes(
+        df, 
+        exclude_categorical=not include_categorical_trace_attrs,
+        enable_id_leakage_filter=enable_id_leakage_filter,
+    )
 
     # Maximale Trace-Länge (Anzahl Events pro Case, max über alle Cases)
     max_prefix_len = int(df.groupby(CASE_COL).size().max())
@@ -205,7 +336,7 @@ def build_encoding_meta(df: pd.DataFrame) -> EncodingMeta:
         max_prefix_len=max_prefix_len,
         activity_vocab=activity_vocab,
         resource_vocab=resource_vocab,
-        month_vocab=month_vocab,
+        time_vocab=time_vocab,
         trace_numeric_cols=trace_numeric,
         trace_categorical_cols=trace_categorical,
         trace_cat_vocabs=trace_cat_vocabs,
@@ -227,6 +358,39 @@ def build_case_index(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     return case_index
 
 
+def filter_valid_prefixes(
+    df: pd.DataFrame,
+    case_ids: np.ndarray,
+    prefix_lengths: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Filtert Prefixe, die länger als der zugehörige Trace sind (BPDP-Verhalten).
+    
+    Args:
+        df: DataFrame mit Event-Log Daten (Case-IDs sind bereits Strings)
+        case_ids: Array der Case-IDs
+        prefix_lengths: Array der Präfix-Längen
+        
+    Returns:
+        Tuple (gefilterte case_ids, gefilterte prefix_lengths, valid_mask)
+    """
+    # Trace-Längen berechnen (Case-IDs im df sind bereits Strings)
+    trace_lengths = df.groupby(CASE_COL).size()
+    
+    # Filtere: nur Prefixe mit prefix_len <= trace_len
+    # Case-IDs konsistent als Strings behandeln
+    valid_mask = np.array([
+        prefix_lengths[i] <= trace_lengths.get(str(case_ids[i]), 0)
+        for i in range(len(case_ids))
+    ])
+    
+    n_filtered = np.sum(~valid_mask)
+    if n_filtered > 0:
+        print(f"  -> {n_filtered} ungültige Prefixe gefiltert (prefix_len > trace_len)")
+    
+    return case_ids[valid_mask], prefix_lengths[valid_mask], valid_mask
+
+
 # ============================================================
 # LSTM-Encoding (Format B)
 # ============================================================
@@ -240,37 +404,46 @@ def encode_prefixes_lstm(
     """
    Erzeugt LSTM-Eingaben für alle Präfixe.
     Schritte:
-    1. Arrays initialisieren: X_act, X_res, X_month (Integer), mask (Float), X_trace (Float)
+    1. Arrays initialisieren: X_act, X_res, X_time (Integer) mit "No"-Token-ID, X_trace (Float)
     2. Case-Index erstellen
-    3. Offsets für kategoriale Trace-Attribute berechnen
-    4. Für jedes Präfix:
-        a. Sequenzen: Activity/Resource/Month-IDs pro Position, mask = 1.0 für echte Events
-        b. Trace-Attribute: numerisch direkt, kategorial als One-Hot
-    6. Rückgabe: Dictionary mit X_act_seq, X_res_seq, X_month_seq, X_trace, mask.
+    3. Für jedes Präfix:
+        a. Sequenzen: Activity/Resource/Time-IDs pro Position überschreiben, Rest bleibt "No"
+        b. Trace-Attribute: numerisch direkt, kategorial als Label-Encoding
+        c. Weekday-Features: 2 Ordinal-ID-Spalten (weekday_start_id, weekday_end_id)
+           - weekday_start_id: immer gesetzt (Integer-ID 1-7 für Monday-Sunday, 0 für UNK)
+           - weekday_end_id: nur wenn prefix_length == max_prefix_len (BPDP-Gating)
+           - Diese IDs werden später gemeinsam mit anderen Trace-Features per StandardScaler skaliert
+    4. Rückgabe: Dictionary mit X_act_seq, X_res_seq, X_time_seq, X_trace (keine mask).
     """
     N = len(case_ids)
     L = meta.max_prefix_len
 
-    #leere Arrays initialisieren (automatisch Padding)
-    X_act = np.zeros((N, L), dtype=np.int32)
-    X_res = np.zeros((N, L), dtype=np.int32)
-    X_month = np.zeros((N, L), dtype=np.int32)
-    mask = np.zeros((N, L), dtype=np.float32)
+    # "No"-Token-IDs für Padding (vorinitialisierung)
+    no_id_act = meta.activity_vocab["No"]
+    no_id_res = meta.resource_vocab["No"]
+    no_id_time = meta.time_vocab["No"]
 
-    # Größe von X_trace Array berechnen (numerische + One-Hot der kategorialen Trace-Attribute)
-    n_trace_features = len(meta.trace_numeric_cols) + sum(
-        len(vocab) for vocab in meta.trace_cat_vocabs.values()
-    )
+    # Arrays mit "No"-Token initialisieren (Padding)
+    X_act = np.full((N, L), no_id_act, dtype=np.int32)
+    X_res = np.full((N, L), no_id_res, dtype=np.int32)
+    X_time = np.full((N, L), no_id_time, dtype=np.int32)
+
+    # Größe von X_trace Array berechnen:
+    # - numerische Trace-Attribute: 1 Feature pro Spalte
+    # - kategoriale Trace-Attribute: 1 Feature pro Spalte (Label-Encoding, nicht One-Hot)
+    # - Weekday-Features: 2 Ordinal-ID-Spalten (weekday_start_id, weekday_end_id)
+    n_numeric = len(meta.trace_numeric_cols)
+    n_cat = len(meta.trace_categorical_cols)
+    n_weekday_features = 2  # weekday_start_id, weekday_end_id
+    n_trace_features = n_numeric + n_cat + n_weekday_features
     X_trace = np.zeros((N, n_trace_features), dtype=np.float32)
-    # Case-Index für schnelle Zugriff auf Events eines Cases (wenn ein Präfix später die Events von Case C benötigt)
+    
+    # Weekday-Mapping: String -> Ordinal-ID (1-7 für Monday-Sunday, 0 für UNK/fehlend)
+    weekday_to_idx = {name: i + 1 for i, name in enumerate(WEEKDAY_NAMES)}
+    # ID 0 ist explizit für unbekannte/fehlende Werte reserviert
+    
+    # Case-Index für schnellen Zugriff auf Events eines Cases
     case_index = build_case_index(df)
-
-    # Offsets für One-Hot-Blöcke der kategorialen Trace-Attribute, weil One-Hot braucht mehrere Spalten pro Attribut. Damit sich die Spalten nicht überlappen -> separate Blöcke
-    trace_cat_offsets: Dict[str, int] = {}
-    offset = len(meta.trace_numeric_cols)
-    for col in meta.trace_categorical_cols:
-        trace_cat_offsets[col] = offset
-        offset += len(meta.trace_cat_vocabs[col])
 
     for i, (cid, k) in enumerate(zip(case_ids, prefix_lengths)):
         cid = str(cid)
@@ -286,20 +459,17 @@ def encode_prefixes_lstm(
             if pos >= L:
                 break
 
-            act_id = meta.activity_vocab.get(str(ev[ACT_COL]), 0)
+            act_id = meta.activity_vocab.get(str(ev[ACT_COL]), no_id_act)
             X_act[i, pos] = act_id
 
-            res_id = meta.resource_vocab.get(str(ev[RES_COL]), 0)
+            res_id = meta.resource_vocab.get(str(ev[RES_COL]), no_id_res)
             X_res[i, pos] = res_id
 
-            month_id = meta.month_vocab.get(int(ev[MONTH_COL]), 0)
-            X_month[i, pos] = month_id
-
-            mask[i, pos] = 1.0
+            time_id = meta.time_vocab.get(str(ev[MONTHYEAR_COL]), no_id_time)
+            X_time[i, pos] = time_id
 
         # 2) Trace-Attribute (aus einem beliebigen Event des Cases; Werte sind pro Case konstant)
-        full_trace_df = trace_df
-        first = full_trace_df.iloc[0]
+        first = trace_df.iloc[0]
         feat_vec = X_trace[i]
 
         # numerische Trace-Attribute direkt schreiben
@@ -307,75 +477,134 @@ def encode_prefixes_lstm(
             val = first[col]
             feat_vec[j] = float(val) if pd.notna(val) else 0.0
 
-        # kategoriale Trace-Attribute als One-Hot
-        for col in meta.trace_categorical_cols:
-            base = trace_cat_offsets[col]
+        # kategoriale Trace-Attribute als Label-Encoding (Integer-ID als float)
+        num_offset = n_numeric
+        for j, col in enumerate(meta.trace_categorical_cols):
             vocab = meta.trace_cat_vocabs[col]
-            val = str(first[col])
-            idx = vocab.get(val)
-            if idx is not None:
-                feat_vec[base + idx] = 1.0
+            val = str(first[col]) if pd.notna(first[col]) else "<UNK>"
+            if val.lower() == "nan":
+                val = "<UNK>"
+            idx = vocab.get(val, 0)  # 0 = <UNK> als Fallback
+            feat_vec[num_offset + j] = float(idx)
+
+        # 3) Weekday-Features (Ordinal-IDs, BPDP-Gating für weekday_end)
+        weekday_offset = n_numeric + n_cat
+        
+        # weekday_start_id: immer setzen (Ordinal-ID 1-7 für Monday-Sunday, 0 für UNK)
+        weekday_start_val = str(first[WEEKDAY_START_COL]) if WEEKDAY_START_COL in first.index else "<UNK>"
+        if weekday_start_val.lower() == "nan":
+            weekday_start_val = "<UNK>"
+        weekday_start_id = weekday_to_idx.get(weekday_start_val, 0)  # 0 = UNK als Fallback
+        feat_vec[weekday_offset] = float(weekday_start_id)
+        
+        # weekday_end_id: nur setzen wenn Prefix vollständig ist (per-case Gating)
+        # Ein Prefix ist vollständig, wenn k >= actual_len (>= für n+1 Labeling)
+        # Für unvollständige Prefixe bleibt weekday_end_id bei 0.0 (keine Info über End-Weekday)
+        is_complete = (k >= actual_len)
+        if is_complete:
+            weekday_end_val = str(first[WEEKDAY_END_COL]) if WEEKDAY_END_COL in first.index else "<UNK>"
+            if weekday_end_val.lower() == "nan":
+                weekday_end_val = "<UNK>"
+            weekday_end_id = weekday_to_idx.get(weekday_end_val, 0)  # 0 = UNK als Fallback
+            feat_vec[weekday_offset + 1] = float(weekday_end_id)
+        # else: weekday_end_id bleibt bei 0.0 (Initialisierung)
 
     return {
         "X_act_seq": X_act,
         "X_res_seq": X_res,
-        "X_month_seq": X_month,
+        "X_time_seq": X_time,
         "X_trace": X_trace,
-        "mask": mask,
     }
 
 
 # ============================================================
-# FFN-Encoding (Format A, CIBE)
+# FFN-Encoding (Format A, CIBE) - DataFrame-basiert mit pd.get_dummies
 # ============================================================
 
 
-def compute_ffn_feature_size(
+def build_ffn_reference_columns(
+    df: pd.DataFrame,
     meta: EncodingMeta,
-) -> Tuple[int, Dict[str, object]]:
+) -> List[str]:
     """
-    Berechnet die Gesamtgröße des CIBE-Vektors und die Offsets der Blöcke.
+    Erstellt Referenz-Spalten für stabiles FFN-Encoding mit pd.get_dummies.
+    
     Schritte:
-    1. Trace-Features (numerisch)
-    2. Trace-Features (kategorial, One-Hot)
-    3. L × One-Hot(Activity)
-    4. L × One-Hot(Resource)
-    5. L × One-Hot(Month)
-    6. Rückgabe: Gesamtgröße EA_star und Dictionary mit Offsets.
+    1. Erstelle ein Referenz-DataFrame mit allen möglichen Werten
+    2. Für jeden Case: fülle Event-Positionen bis max_prefix_len
+    3. Padding-Positionen erhalten NaN (keine künstlichen "_No" Dummies)
+    4. Weekday-Features: weekday_start und weekday_end (BPDP-Gating)
+    5. Wende pd.get_dummies an und speichere die Spaltennamen
+    6. Diese Spalten werden dann für alle zukünftigen Encodings verwendet
+    
+    Returns:
+        Liste der Spaltennamen in stabiler Reihenfolge
     """
-    offsets: Dict[str, object] = {}
-    offset = 0
-
-    # Trace-numerisch
-    offsets["trace_numeric"] = (offset, len(meta.trace_numeric_cols))
-    offset += len(meta.trace_numeric_cols)
-
-    # Trace-kategorial (One-Hot)
-    trace_cat_offsets: Dict[str, int] = {}
-    for col in meta.trace_categorical_cols:
-        trace_cat_offsets[col] = offset
-        offset += len(meta.trace_cat_vocabs[col])
-    offsets["trace_cat"] = trace_cat_offsets
-
     L = meta.max_prefix_len
-
-    # Activities
-    offsets["act_start"] = offset
-    n_act = len(meta.activity_vocab)
-    offset += L * n_act
-
-    # Resources
-    offsets["res_start"] = offset
-    n_res = len(meta.resource_vocab)
-    offset += L * n_res
-
-    # Months
-    offsets["month_start"] = offset
-    n_month = len(meta.month_vocab)
-    offset += L * n_month
-
-    EA_star = offset
-    return EA_star, offsets
+    case_index = build_case_index(df)
+    
+    # Sammle alle Cases für Referenz-DataFrame
+    ref_rows = []
+    for cid in df[CASE_COL].unique():
+        trace_df = case_index[str(cid)]
+        first = trace_df.iloc[0]
+        actual_len = len(trace_df)
+        
+        # Eine Zeile pro Case mit vollständigem Trace (bis max_len)
+        row_data = {}
+        
+        # Trace-Features: numerisch als Zahl, kategorial als Original-String (One-Hot via get_dummies)
+        for col in meta.trace_numeric_cols:
+            row_data[col] = float(first[col]) if pd.notna(first[col]) else 0.0
+        
+        for col in meta.trace_categorical_cols:
+            val = str(first[col]) if pd.notna(first[col]) else "<UNK>"
+            if val.lower() == "nan":
+                val = "<UNK>"
+            row_data[col] = val
+        
+        # Weekday-Features (für Referenz: alle Weekdays einbeziehen)
+        # weekday_start: immer setzen
+        if WEEKDAY_START_COL in first.index:
+            row_data[WEEKDAY_START_COL] = str(first[WEEKDAY_START_COL])
+        else:
+            row_data[WEEKDAY_START_COL] = "<UNK>"
+        
+        # weekday_end: immer setzen für Referenz-Spalten (um vollständige Dummy-Set zu erstellen)
+        # Das Gating (nur vollständige Prefixe) erfolgt in encode_prefixes_ffn()
+        if WEEKDAY_END_COL in first.index:
+            row_data[WEEKDAY_END_COL] = str(first[WEEKDAY_END_COL])
+        else:
+            row_data[WEEKDAY_END_COL] = np.nan
+        
+        # Event-Positionen 1..L (echte Werte oder NaN für Padding)
+        for pos in range(L):
+            if pos < actual_len:
+                ev = trace_df.iloc[pos]
+                row_data[f"act_{pos+1}"] = str(ev[ACT_COL])
+                row_data[f"res_{pos+1}"] = str(ev[RES_COL])
+                row_data[f"time_{pos+1}"] = str(ev[MONTHYEAR_COL])
+            else:
+                # Padding = NaN (keine künstlichen "_No" Dummies)
+                row_data[f"act_{pos+1}"] = np.nan
+                row_data[f"res_{pos+1}"] = np.nan
+                row_data[f"time_{pos+1}"] = np.nan
+        
+        ref_rows.append(row_data)
+    
+    ref_df = pd.DataFrame(ref_rows)
+    ref_encoded = pd.get_dummies(ref_df, dummy_na=False)
+    
+    # Sicherstellen, dass alle Weekday-Dummies existieren (auch wenn nicht im Datensatz vorhanden)
+    # weekday_start_Monday ... weekday_start_Sunday, weekday_end_Monday ... weekday_end_Sunday
+    existing_cols = set(ref_encoded.columns)
+    for day in WEEKDAY_NAMES:
+        for prefix in [WEEKDAY_START_COL, WEEKDAY_END_COL]:
+            col_name = f"{prefix}_{day}"
+            if col_name not in existing_cols:
+                ref_encoded[col_name] = 0
+    
+    return list(ref_encoded.columns)
 
 
 def encode_prefixes_ffn(
@@ -383,91 +612,110 @@ def encode_prefixes_ffn(
     meta: EncodingMeta,
     case_ids: np.ndarray,
     prefix_lengths: np.ndarray,
+    reference_columns: List[str] = None,
 ) -> np.ndarray:
     """
-    Erzeugt den CIBE-Feature-Vektor g_i für jedes Präfix:
+    Erzeugt FFN-Feature-Vektoren mittels DataFrame-basiertem One-Hot-Encoding (pd.get_dummies).
 
-      g_i = [ Trace-Features ,
-              Event-Features(Activity) für Position 1..L ,
-              Event-Features(Resource) für Position 1..L ,
-              Event-Features(Month) für Position 1..L ]
-
-    Für jedes Präfix:
-    1. Trace-Features: numerisch direkt, kategorial als One-Hot
-    2. Event-Features pro Position: Activity/Resource/Month als One-Hot
-    Unterschied zu LSTM: Hier werden Event-Attribute pro Position als One-Hot kodiert (nicht als Integer-Sequenz).
-    Rückgabe: Array X mit Shape (N, EA_star)
-    """
-    # Array X initialisieren
-    N = len(case_ids)
-    EA_star, offsets = compute_ffn_feature_size(meta)
-    X = np.zeros((N, EA_star), dtype=np.float32)
-
-    case_index = build_case_index(df)
-    L = meta.max_prefix_len
+    Schritte:
+    1. Erstelle "wide" DataFrame mit einer Zeile pro Präfix:
+       - Trace-Features: numerisch als Zahlen, kategorial als Original-Strings (One-Hot)
+       - Weekday-Features: weekday_start immer, weekday_end nur bei k == max_prefix_len (BPDP-Gating)
+       - Event-Positionen act_1..act_L, res_1..res_L, time_1..time_L als Strings
+       - Padding mit NaN (keine künstlichen "_No" Dummies)
+    2. Wende pd.get_dummies an für automatisches One-Hot-Encoding
+    3. Stabilisiere Spalten mittels reference_columns
+    4. Fülle verbleibende NaNs mit 0
+    5. Konvertiere zu numpy array
     
-    # Offsets für die einzelnen Blöcke
-    trace_num_start, _ = offsets["trace_numeric"]
-    trace_cat_offsets = offsets["trace_cat"]
-    act_start = offsets["act_start"]
-    res_start = offsets["res_start"]
-    month_start = offsets["month_start"]
-
-    # Größen der One-Hot-Blöcke
-    n_act = len(meta.activity_vocab)
-    n_res = len(meta.resource_vocab)
-    n_month = len(meta.month_vocab)
-
-# Für jedes Präfix i holen wir (Case-ID id, Präfixlänge k), und i gibt an, in welche Zeile die Features geschrieben werden.
+    Args:
+        df: DataFrame mit Event-Log Daten
+        meta: EncodingMeta mit Vokabularen und Metadaten
+        case_ids: Array der Case-IDs
+        prefix_lengths: Array der Präfix-Längen
+        reference_columns: Optional - Referenz-Spaltenliste für stabile Spaltenreihenfolge
+        
+    Returns:
+        numpy array mit Shape (N, n_features)
+    """
+    N = len(case_ids)
+    L = meta.max_prefix_len
+    case_index = build_case_index(df)
+    
+    # 1) Baue "wide" DataFrame
+    rows = []
     for i, (cid, k) in enumerate(zip(case_ids, prefix_lengths)):
         cid = str(cid)
         k = int(k)
 
         trace_df = case_index[cid]
-        # k kann n+1 sein (vollständiger Trace), aber trace_df hat nur n Zeilen
         actual_len = len(trace_df)
         prefix_df = trace_df.iloc[:min(k, actual_len)]
-        row = X[i]
-
-        # ---- 1) Trace-Features ----
         first = trace_df.iloc[0]
 
-        # numerische Trace-Attribute
-        for j, col in enumerate(meta.trace_numeric_cols):
-            row[trace_num_start + j] = float(first[col]) if pd.notna(first[col]) else 0.0
+        row_data = {}
+        
+        # Trace-Features: numerisch als Zahl, kategorial als Original-String (One-Hot)
+        for col in meta.trace_numeric_cols:
+            row_data[col] = float(first[col]) if pd.notna(first[col]) else 0.0
 
-        # kategoriale Trace-Attribute (One-Hot)
         for col in meta.trace_categorical_cols:
-            base = trace_cat_offsets[col]
-            vocab = meta.trace_cat_vocabs[col]
-            val = str(first[col])
-            idx = vocab.get(val)
-            if idx is not None:
-                row[base + idx] = 1.0
+            val = str(first[col]) if pd.notna(first[col]) else "<UNK>"
+            if val.lower() == "nan":
+                val = "<UNK>"
+            row_data[col] = val
+        
+        # Weekday-Features (BPDP-Gating für weekday_end)
+        # weekday_start: immer setzen
+        if WEEKDAY_START_COL in first.index:
+            row_data[WEEKDAY_START_COL] = str(first[WEEKDAY_START_COL])
+        else:
+            row_data[WEEKDAY_START_COL] = "<UNK>"
+        
+        # weekday_end: nur setzen wenn Prefix vollständig ist (per-case Gating)
+        # Ein Prefix ist vollständig, wenn k >= actual_len (>= für n+1 Labeling)
+        # Sonst als fehlend behandeln → alle weekday_end_* = 0 nach get_dummies
+        is_complete = (k >= actual_len)
+        if is_complete and WEEKDAY_END_COL in first.index:
+            row_data[WEEKDAY_END_COL] = str(first[WEEKDAY_END_COL])
+        else:
+            row_data[WEEKDAY_END_COL] = np.nan  # wird zu 0 nach get_dummies
+        
+        # Event-Positionen 1..L (Strings für echte Events, NaN für Padding)
+        for pos in range(L):
+            if pos < min(k, actual_len):
+                ev = prefix_df.iloc[pos]
+                row_data[f"act_{pos+1}"] = str(ev[ACT_COL])
+                row_data[f"res_{pos+1}"] = str(ev[RES_COL])
+                row_data[f"time_{pos+1}"] = str(ev[MONTHYEAR_COL])
+            else:
+                # Padding = NaN (keine künstlichen "_No" Dummies)
+                row_data[f"act_{pos+1}"] = np.nan
+                row_data[f"res_{pos+1}"] = np.nan
+                row_data[f"time_{pos+1}"] = np.nan
+        
+        rows.append(row_data)
+    
+    clean_df = pd.DataFrame(rows)
+    
+    # 2) One-Hot-Encoding mit pd.get_dummies
+    enc_df = pd.get_dummies(clean_df, dummy_na=False)
+    
+    # 3) Spalten stabilisieren
+    if reference_columns is None:
+        # Erste Verwendung: erstelle Referenz-Spalten
+        reference_columns = build_ffn_reference_columns(df, meta)
+    
+    # Fehlende Spalten hinzufügen (Wert 0) und Reihenfolge stabilisieren
+    enc_df = enc_df.reindex(columns=reference_columns, fill_value=0)
+    
+    # 4) Fehlende NaNs mit 0 füllen
+    enc_df = enc_df.fillna(0)
+    
+    # 5) Zu numpy konvertieren (dtype float32)
+    X_ffn = enc_df.to_numpy(dtype=np.float32)
 
-        # ---- 2) Event-Features pro Position 1..L ----
-        # Verwende min(k, actual_len, L) um IndexError zu vermeiden
-        for pos in range(min(k, actual_len, L)):
-            ev = prefix_df.iloc[pos]
-
-            # Activity One-Hot
-            a_id = meta.activity_vocab.get(str(ev[ACT_COL]), None)
-            if a_id is not None and a_id > 0:
-                row[act_start + pos * n_act + (a_id - 1)] = 1.0
-
-            # Resource One-Hot
-            r_id = meta.resource_vocab.get(str(ev[RES_COL]), None)
-            if r_id is not None and r_id > 0:
-                row[res_start + pos * n_res + (r_id - 1)] = 1.0
-
-            # Month One-Hot
-            m_id = meta.month_vocab.get(int(ev[MONTH_COL]), None)
-            if m_id is not None and m_id > 0:
-                row[month_start + pos * n_month + (m_id - 1)] = 1.0
-
-        # Positionen > k bleiben 0 (Padding)
-
-    return X
+    return X_ffn
 
 
 # ============================================================
@@ -517,6 +765,16 @@ def main():
         default=None,
         help="Output-Verzeichnis. Standard: data/processed/ oder data/processed/{dataset}/"
     )
+    parser.add_argument(
+        "--include-categorical-trace-attrs",
+        action="store_true",
+        help="Bezieht kategorische Trace-Attribute in das Encoding ein (standardmäßig werden nur numerische verwendet)"
+    )
+    parser.add_argument(
+        "--enable-id-leakage-filter",
+        action="store_true",
+        help="Aktiviert den ID-/Leakage-Filter für Trace-Attribute (Default: AUS für Reproduktion)"
+    )
     
     args = parser.parse_args()
     
@@ -557,14 +815,38 @@ def main():
 
     print(f"Lade Roh-Log aus {log_path} ...")
     df = load_event_log_to_df(str(log_path))
+    
+    # Weekday-Features hinzufügen (BPDP-Verhalten)
+    print("Füge Weekday-Features hinzu (weekday_start, weekday_end) ...")
+    df = add_weekday_features(df)
 
     print(f"Lade IDP-Labels aus {labels_path} ...")
     labels = np.load(labels_path, allow_pickle=True)
-    case_ids = labels["case_ids"]
-    prefix_lengths = labels["prefix_lengths"]
+    case_ids_orig = labels["case_ids"]
+    prefix_lengths_orig = labels["prefix_lengths"]
+    y_idp = labels["y_idp"] if "y_idp" in labels else None
+    
+    # Prefix-Filtering: Nur gültige Prefixe verwenden (BPDP-Verhalten)
+    print(f"Filtere ungültige Prefixe (prefix_len > trace_len)...")
+    case_ids, prefix_lengths, valid_mask = filter_valid_prefixes(df, case_ids_orig, prefix_lengths_orig)
+    print(f"  -> {len(case_ids)} gültige Prefixe verbleiben")
+    
+    # y-Labels entsprechend filtern
+    if y_idp is not None:
+        y_idp = y_idp[valid_mask]
 
     print("Bestimme Encoding-Metadaten (Vokabulare, Trace-Attribute, max_prefix_len) ...")
-    meta = build_encoding_meta(df)
+    if args.include_categorical_trace_attrs:
+        print("  -> Kategorische Trace-Attribute werden einbezogen")
+    else:
+        print("  -> Nur numerische Trace-Attribute (kategorische werden ignoriert)")
+    if args.enable_id_leakage_filter:
+        print("  -> ID-/Leakage-Filter ist aktiviert")
+    meta = build_encoding_meta(
+        df, 
+        include_categorical_trace_attrs=args.include_categorical_trace_attrs,
+        enable_id_leakage_filter=args.enable_id_leakage_filter,
+    )
 
     # ---------- LSTM-Encoding ----------
     print("Erzeuge LSTM-Eingaben ...")
@@ -573,25 +855,60 @@ def main():
         processed_dir / "encoding_lstm.npz",
         X_act_seq=lstm_inputs["X_act_seq"],
         X_res_seq=lstm_inputs["X_res_seq"],
-        X_month_seq=lstm_inputs["X_month_seq"],
+        X_time_seq=lstm_inputs["X_time_seq"],
         X_trace=lstm_inputs["X_trace"],
-        mask=lstm_inputs["mask"],
     )
 
-    # ---------- FFN-Encoding (CIBE) ----------
-    print("Erzeuge FFN-CIBE-Vektoren ...")
-    X_ffn = encode_prefixes_ffn(df, meta, case_ids, prefix_lengths)
+    # ---------- FFN-Encoding (CIBE) - DataFrame-basiert ----------
+    print("Erzeuge FFN-Referenz-Spalten für stabiles One-Hot-Encoding ...")
+    ffn_reference_columns = build_ffn_reference_columns(df, meta)
+    print(f"  -> {len(ffn_reference_columns)} Features")
+    
+    print("Erzeuge FFN-CIBE-Vektoren mit pd.get_dummies ...")
+    X_ffn = encode_prefixes_ffn(df, meta, case_ids, prefix_lengths, reference_columns=ffn_reference_columns)
     np.save(processed_dir / "encoding_ffn.npy", X_ffn)
 
+    # ---------- Gefilterte Labels speichern ----------
+    print("Speichere gefilterte Labels ...")
+    filtered_labels = {
+        "case_ids": case_ids,
+        "prefix_lengths": prefix_lengths,
+    }
+    if y_idp is not None:
+        filtered_labels["y_idp"] = y_idp
+    np.savez_compressed(processed_dir / "encoding_labels.npz", **filtered_labels)
+
     # ---------- Meta speichern ----------
+    # Berechne LSTM X_trace Feature-Informationen
+    # - numerische Trace-Attribute: 1 Feature pro Spalte
+    # - kategoriale Trace-Attribute: 1 Feature pro Spalte (Label-Encoding)
+    # - Weekday-Features: 2 Ordinal-ID-Spalten (weekday_start_id, weekday_end_id)
+    n_numeric = len(meta.trace_numeric_cols)
+    n_cat = len(meta.trace_categorical_cols)
+    n_weekday_features = 2  # weekday_start_id, weekday_end_id
+    lstm_trace_feature_count = n_numeric + n_cat + n_weekday_features
+    
+    # Berechne LSTM Trace-Feature-Spalten (für Interpretierbarkeit)
+    # Bei Label-Encoding: nur die Spaltennamen, nicht col_<value>
+    # Weekday-Features: weekday_start_id, weekday_end_id (Ordinal-IDs, später skaliert)
+    lstm_trace_columns = list(meta.trace_numeric_cols) + list(meta.trace_categorical_cols)
+    lstm_trace_columns.append("weekday_start_id")
+    lstm_trace_columns.append("weekday_end_id")
+    
     meta_dict = {
         "max_prefix_len": meta.max_prefix_len,
         "activity_vocab": meta.activity_vocab,
         "resource_vocab": meta.resource_vocab,
-        "month_vocab": meta.month_vocab,
+        "time_vocab": meta.time_vocab,
         "trace_numeric_cols": meta.trace_numeric_cols,
         "trace_categorical_cols": meta.trace_categorical_cols,
         "trace_cat_vocabs": meta.trace_cat_vocabs,
+        "lstm_trace_feature_count": lstm_trace_feature_count,
+        "lstm_trace_columns": lstm_trace_columns,
+        "weekday_names": WEEKDAY_NAMES,
+        "ffn_reference_columns": ffn_reference_columns,
+        "n_samples_original": len(case_ids_orig),
+        "n_samples_filtered": len(case_ids),
     }
     with open(processed_dir / "encoding_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta_dict, f, indent=2, ensure_ascii=False)
@@ -599,6 +916,7 @@ def main():
     print("Fertig.")
     print(f"  LSTM-Inputs : {processed_dir / 'encoding_lstm.npz'}")
     print(f"  FFN-Inputs  : {processed_dir / 'encoding_ffn.npy'}")
+    print(f"  Labels      : {processed_dir / 'encoding_labels.npz'}")
     print(f"  Meta        : {processed_dir / 'encoding_meta.json'}")
 
 

@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -20,7 +21,7 @@ import pm4py
 # Konfiguration
 # =========================
 
-N_ALIGNMENT_RUNS = 100  # Grohs: "We calculate the log-wide alignments 100 times"
+N_ALIGNMENT_RUNS = 1  # Grohs: "We calculate the log-wide alignments 100 times"
 
 
 @dataclass
